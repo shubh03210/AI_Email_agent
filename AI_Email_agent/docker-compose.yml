@@ -1,49 +1,130 @@
 version: "3.9"
 
 services:
-  db:
-    image: postgres:15
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: email_agent_postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: email_agent
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d email_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
+  # ── Redis ────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
+    container_name: email_agent_redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
   backend:
-    build: ./backend
-    env_file: ./backend/.env
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email_agent_backend
+    restart: unless-stopped
     ports:
       - "8000:8000"
-    depends_on:
-      - db
-      - redis
+    env_file:
+      - ./backend/.env
     volumes:
-      - ./backend:/app
-
-  worker:
-    build: ./backend
-    env_file: ./backend/.env
-    command: celery -A app.workers.celery_app worker --loglevel=info
+      - ./backend/credentials:/app/credentials:ro
+      - backend_logs:/app/logs
     depends_on:
-      - db
-      - redis
-    volumes:
-      - ./backend:/app
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
+  # ── Celery Worker ────────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email_agent_celery_worker
+    restart: unless-stopped
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --queues=default,agent,gmail
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend/credentials:/app/credentials:ro
+      - backend_logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Celery Beat (Scheduler) ──────────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email_agent_celery_beat
+    restart: unless-stopped
+    command: >
+      celery -A app.workers.celery_app beat
+      --loglevel=info
+      --scheduler celery.beat:PersistentScheduler
+    env_file:
+      - ./backend/.env
+    volumes:
+      - celery_beat_data:/app/celerybeat-schedule
+      - backend_logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Streamlit Frontend ───────────────────────────────────────────────────────
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: email_agent_frontend
+    restart: unless-stopped
     ports:
       - "8501:8501"
+    environment:
+      - API_BASE_URL=http://backend:8000/api/v1
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
+# ── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
+  redis_data:
+  backend_logs:
+  celery_beat_data:

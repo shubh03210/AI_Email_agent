@@ -1,48 +1,49 @@
-# API
+# ── API ────────────────────────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
 python-multipart
 email-validator
 
-# Pydantic
+# ── Pydantic ───────────────────────────────────────────────────────────────────
 pydantic
 pydantic-settings
 
-# Database
-sqlalchemy
+# ── Database ───────────────────────────────────────────────────────────────────
 sqlalchemy[asyncio]
 psycopg2-binary
 asyncpg
 alembic
 
-# LangChain / LangGraph
+# ── LangChain / LangGraph ──────────────────────────────────────────────────────
 langchain
 langgraph
 langchain-groq
+langchain-core
 
-# LLM Providers
+# ── LLM Providers ─────────────────────────────────────────────────────────────
 groq
 
-# Google APIs
+# ── Google APIs ────────────────────────────────────────────────────────────────
 google-api-python-client
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
 
-# Task Queue
+# ── Task Queue ─────────────────────────────────────────────────────────────────
 redis
-celery
 celery[redis]
 
-# Auth / Security
+# ── Auth / Security ────────────────────────────────────────────────────────────
 python-jose[cryptography]
 passlib[bcrypt]
 
-# Utilities
+# ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv
 httpx
 loguru
+tenacity
 
-# Testing
+# ── Testing ────────────────────────────────────────────────────────────────────
 pytest
 pytest-asyncio
+httpx
