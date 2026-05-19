@@ -28,8 +28,14 @@ env/
 # Alembic
 alembic/versions/
 
+# Google OAuth credentials & tokens — NEVER commit these
+credentials/
+*_credentials.json
+*_token.json
+
 # Logs
 *.log
+logs/
 
 # Docker
 .dockerignore
