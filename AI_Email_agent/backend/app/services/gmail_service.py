@@ -284,27 +284,37 @@ def fetch_unread_messages(
     user_id: str = "me",
     max_results: int = 20,
     label_ids: Optional[list[str]] = None,
+    q: Optional[str] = None,
 ) -> list[ParsedMessage]:
     """
-    Fetch and parse all unread messages from the inbox.
+    Fetch and parse unread messages from the inbox.
 
     Args:
-        user_id:    Gmail user ID.
+        user_id:     Gmail user ID.
         max_results: Maximum number of messages to return.
-        label_ids:  Additional label filters (default: INBOX + UNREAD).
+        label_ids:   Label filters (default: INBOX + UNREAD).
+        q:           Gmail search query string (e.g. "from:a@b.com is:unread").
+                     When provided, label_ids are still applied alongside q.
 
     Returns:
         List of ParsedMessage sorted by timestamp ascending.
     """
     service = _build_service()
-    labels = label_ids or ["INBOX", "UNREAD"]
 
     try:
-        list_resp = service.users().messages().list(
-            userId=user_id,
-            labelIds=labels,
-            maxResults=max_results,
-        ).execute()
+        list_kwargs: dict = {
+            "userId": user_id,
+            "maxResults": max_results,
+        }
+        if q:
+            # When a q= is provided it already contains is:unread; adding
+            # labelIds=["UNREAD"] on top causes no issues but is redundant.
+            list_kwargs["q"] = q
+        else:
+            # Default: only INBOX + UNREAD labels
+            list_kwargs["labelIds"] = label_ids or ["INBOX", "UNREAD"]
+
+        list_resp = service.users().messages().list(**list_kwargs).execute()
 
         message_refs = list_resp.get("messages", [])
         if not message_refs:

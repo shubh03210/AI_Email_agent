@@ -61,10 +61,11 @@ celery_app.conf.task_default_exchange     = "default"
 celery_app.conf.task_default_routing_key  = "default"
 
 celery_app.conf.task_routes = {
-    "app.workers.tasks.run_agent_task":     {"queue": "agent",   "routing_key": "agent"},
-    "app.workers.tasks.send_outreach_task": {"queue": "gmail",   "routing_key": "gmail"},
-    "app.workers.tasks.poll_inbox_task":    {"queue": "gmail",   "routing_key": "gmail"},
-    "app.workers.tasks.cleanup_old_logs":   {"queue": "default", "routing_key": "default"},
+    "app.workers.tasks.run_agent_task":               {"queue": "agent",   "routing_key": "agent"},
+    "app.workers.tasks.send_outreach_task":           {"queue": "gmail",   "routing_key": "gmail"},
+    "app.workers.tasks.poll_inbox_task":              {"queue": "gmail",   "routing_key": "gmail"},
+    "app.workers.tasks.follow_up_silent_prospects":   {"queue": "gmail",   "routing_key": "gmail"},
+    "app.workers.tasks.cleanup_old_logs":             {"queue": "default", "routing_key": "default"},
 }
 
 # ── Beat Schedule ─────────────────────────────────────────────────────────────
@@ -73,6 +74,11 @@ celery_app.conf.beat_schedule = {
     "poll-inbox": {
         "task":     "app.workers.tasks.poll_inbox_task",
         "schedule": settings.GMAIL_POLL_INTERVAL_SECONDS,  # seconds
+        "options":  {"queue": "gmail"},
+    },
+    "follow-up-silent-prospects": {
+        "task":     "app.workers.tasks.follow_up_silent_prospects",
+        "schedule": crontab(hour=8, minute=0),             # daily at 08:00 UTC
         "options":  {"queue": "gmail"},
     },
     "cleanup-old-logs": {

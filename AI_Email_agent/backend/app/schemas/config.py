@@ -16,6 +16,8 @@ class AgentConfigRead(BaseModel):
     timezone: str
     working_hours_start: int
     working_hours_end: int
+    follow_up_days: int
+    max_follow_ups: int
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -28,6 +30,8 @@ class AgentConfigUpdate(BaseModel):
     timezone: Optional[str] = Field(None, max_length=64)
     working_hours_start: Optional[int] = Field(None, ge=0, le=23)
     working_hours_end: Optional[int] = Field(None, ge=1, le=24)
+    follow_up_days: Optional[int] = Field(None, ge=1, le=30)
+    max_follow_ups: Optional[int] = Field(None, ge=0, le=10)
     is_active: Optional[bool] = None
 
 
@@ -38,4 +42,6 @@ class AgentConfigCreate(BaseModel):
     timezone: str = Field(default="UTC", max_length=64)
     working_hours_start: int = Field(default=9, ge=0, le=23)
     working_hours_end: int = Field(default=18, ge=1, le=24)
+    follow_up_days: int = Field(default=3, ge=1, le=30)
+    max_follow_ups: int = Field(default=2, ge=0, le=10)
     is_active: bool = True

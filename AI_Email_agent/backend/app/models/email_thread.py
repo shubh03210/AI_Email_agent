@@ -1,7 +1,8 @@
 import enum
+from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import ForeignKey, Index, String
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -39,6 +40,12 @@ class EmailThread(Base, TimestampMixin):
         nullable=False,
         default=ThreadStatus.PENDING.value,
         index=True,
+    )
+    follow_up_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    last_outreach_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
     )
 
     prospect: Mapped["Prospect"] = relationship(

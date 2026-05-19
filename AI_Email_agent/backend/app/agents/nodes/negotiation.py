@@ -122,9 +122,7 @@ async def negotiation(state: AgentState) -> AgentState:
         return updates
 
     except Exception as exc:
-        logger.error(
-            f"[negotiation] thread={thread_id} error={exc}", exc_info=True
-        )
+        logger.exception(f"[negotiation] thread={thread_id} failed")
         return {
             **state,
             "negotiation_action": "hold",

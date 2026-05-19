@@ -26,6 +26,20 @@ from typing import Any, Optional
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+
+def _run(coro):
+    """
+    Run an async coroutine from a sync Celery task using a brand-new
+    event loop each time. This avoids the 'Future attached to a different
+    loop' error that occurs with --pool=solo when asyncpg connections
+    linger between calls.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
 from celery import Task
 from celery.utils.log import get_task_logger
 from sqlalchemy import delete, select
@@ -70,15 +84,15 @@ def poll_inbox_task(self) -> dict[str, Any]:
     """
     logger.info("[poll_inbox_task] Starting Gmail poll")
     try:
-        return asyncio.run(_poll_inbox())
+        return _run(_poll_inbox())
     except Exception as exc:
-        logger.error(f"[poll_inbox_task] Fatal error: {exc}", exc_info=True)
+        logger.exception("[poll_inbox_task] Fatal error")
         raise self.retry(exc=exc)
 
 
 async def _poll_inbox() -> dict[str, Any]:
     from app.core.config import settings
-    from app.db.session import AsyncSessionLocal
+    from app.db.session import CelerySessionLocal
     from app.models.prospect import Prospect, ProspectStatus
     from app.services.memory_service import get_or_create_thread, save_message
 
@@ -87,35 +101,72 @@ async def _poll_inbox() -> dict[str, Any]:
     errors = 0
     enqueued_thread_ids: set[int] = set()
 
+    # ── Build targeted Gmail query from all known prospect emails ─────────────
+    # Using Gmail's q= parameter so we make ONE API call and only receive
+    # messages that can actually match a prospect — newsletters/notifications
+    # are automatically excluded.  Much faster and more reliable than fetching
+    # the generic "top 50 unread" which gets swamped by junk mail.
     try:
         from app.services.gmail_service import fetch_unread_messages
-        messages_raw = fetch_unread_messages(max_results=50)
-        # Normalise ParsedMessage dataclasses to plain dicts
-        messages = [
-            {
-                "id":        m.message_id,
-                "thread_id": m.thread_id,
-                "from":      m.sender,
-                "subject":   m.subject,
-                "body":      m.body,
-                "timestamp": m.timestamp.isoformat(),
-            }
-            for m in messages_raw
-        ]
+
+        # Load all prospect emails from DB
+        async with CelerySessionLocal() as db:
+            prospect_result = await db.execute(
+                select(Prospect).where(Prospect.email.isnot(None))
+            )
+            all_prospects = prospect_result.scalars().all()
+            prospect_emails = [
+                p.email.strip().lower() for p in all_prospects if p.email and "@" in p.email
+            ]
+
+        if not prospect_emails:
+            logger.info("[poll_inbox] No prospects configured — nothing to poll.")
+            return {"processed": 0, "enqueued": 0, "errors": 0}
+
+        # Gmail q= "from:a@b.com OR from:c@d.com ... is:unread"
+        # Gmail API has a URL length limit; chunk at 30 emails per query
+        messages_raw = []
+        seen_msg_ids: set[str] = set()
+        chunk_size = 30
+        for i in range(0, len(prospect_emails), chunk_size):
+            chunk = prospect_emails[i : i + chunk_size]
+            q_parts = [f"from:{e}" for e in chunk]
+            q = "(" + " OR ".join(q_parts) + ") is:unread"
+            chunk_msgs = fetch_unread_messages(max_results=100, q=q)
+            for m in chunk_msgs:
+                if m.message_id not in seen_msg_ids:
+                    messages_raw.append(m)
+                    seen_msg_ids.add(m.message_id)
+
     except Exception as exc:
         logger.error(f"[poll_inbox] Gmail fetch failed: {exc}")
         return {"processed": 0, "enqueued": 0, "errors": 1}
 
+    # Normalise ParsedMessage dataclasses to plain dicts
+    messages = [
+        {
+            "id":        m.message_id,
+            "thread_id": m.thread_id,
+            "from":      m.sender,
+            "subject":   m.subject,
+            "body":      m.body,
+            "timestamp": m.timestamp.isoformat(),
+        }
+        for m in messages_raw
+    ]
+
     if not messages:
-        logger.info("[poll_inbox] No new messages.")
+        logger.info("[poll_inbox] No unread replies from known prospects.")
         return {"processed": 0, "enqueued": 0, "errors": 0}
 
-    logger.info(f"[poll_inbox] Found {len(messages)} unread message(s)")
+    logger.info(f"[poll_inbox] Found {len(messages)} message(s) from known prospects")
 
-    async with AsyncSessionLocal() as db:
+    async with CelerySessionLocal() as db:
         for raw_msg in messages:
             try:
-                sender_email: str = raw_msg.get("from", "").strip()
+                sender_raw: str = raw_msg.get("from", "").strip()
+                # Extract bare email from "Name <email>" or "email" format
+                sender_email: str = _parse_email_address(sender_raw)
                 body: str = raw_msg.get("body", "").strip()
                 gmail_thread_id: str = raw_msg.get("thread_id", "")
                 subject: str = raw_msg.get("subject", "(No Subject)")
@@ -138,26 +189,20 @@ async def _poll_inbox() -> dict[str, Any]:
                 except Exception:
                     msg_ts = datetime.now(dt_timezone.utc)
 
-                # Find or create Prospect by sender email
+                # Look up existing prospect — only process known contacts.
+                # Unknown senders (newsletters, notifications, etc.) are
+                # intentionally ignored; prospects must be added manually.
                 result = await db.execute(
                     select(Prospect).where(Prospect.email == sender_email)
                 )
                 prospect = result.scalar_one_or_none()
 
                 if prospect is None:
-                    # Auto-create unknown senders as prospects
-                    prospect = Prospect(
-                        name=_extract_name(sender_email),
-                        email=sender_email,
-                        timezone=settings.AGENT_DEFAULT_TIMEZONE,
-                        status=ProspectStatus.CONTACTED.value,
+                    logger.debug(
+                        f"[poll_inbox] Unknown sender '{sender_email}' — skipping "
+                        "(add them manually via the Prospects page to enable agent processing)"
                     )
-                    db.add(prospect)
-                    await db.flush()
-                    logger.info(
-                        f"[poll_inbox] New prospect created: {sender_email} "
-                        f"id={prospect.id}"
-                    )
+                    continue
 
                 # Find or create EmailThread
                 thread = await get_or_create_thread(
@@ -202,9 +247,7 @@ async def _poll_inbox() -> dict[str, Any]:
                     )
 
             except Exception as msg_exc:
-                logger.error(
-                    f"[poll_inbox] Error processing message: {msg_exc}", exc_info=True
-                )
+                logger.exception("[poll_inbox] Error processing message")
                 errors += 1
                 continue
 
@@ -241,14 +284,14 @@ def run_agent_task(self, thread_id: int) -> dict[str, Any]:
     """
     logger.info(f"[run_agent_task] thread_id={thread_id}")
     try:
-        result = asyncio.run(_run_agent(thread_id))
+        result = _run(_run_agent(thread_id))
         logger.info(
             f"[run_agent_task] Done | thread={thread_id} "
             f"intent={result.get('intent')} reply_sent={result.get('reply_sent')}"
         )
         return result
     except Exception as exc:
-        logger.error(f"[run_agent_task] thread={thread_id} error: {exc}", exc_info=True)
+        logger.exception(f"[run_agent_task] thread={thread_id} failed")
         raise self.retry(exc=exc, countdown=60)
 
 
@@ -296,28 +339,26 @@ def send_outreach_task(self, prospect_id: int) -> dict[str, Any]:
     """
     logger.info(f"[send_outreach_task] prospect_id={prospect_id}")
     try:
-        result = asyncio.run(_send_outreach(prospect_id))
+        result = _run(_send_outreach(prospect_id))
         logger.info(
             f"[send_outreach_task] Done | prospect={prospect_id} "
             f"sent={result.get('sent')} thread={result.get('gmail_thread_id')}"
         )
         return result
     except Exception as exc:
-        logger.error(
-            f"[send_outreach_task] prospect={prospect_id} error: {exc}", exc_info=True
-        )
+        logger.exception(f"[send_outreach_task] prospect={prospect_id} failed")
         raise self.retry(exc=exc, countdown=120)
 
 
 async def _send_outreach(prospect_id: int) -> dict[str, Any]:
     from app.core.config import settings
-    from app.db.session import AsyncSessionLocal
+    from app.db.session import CelerySessionLocal
     from app.models.prospect import Prospect, ProspectStatus
     from app.repositories.config_repo import get_or_create_default
     from app.services.llm_service import generate_outreach_email
     from app.services.memory_service import get_or_create_thread, save_message
 
-    async with AsyncSessionLocal() as db:
+    async with CelerySessionLocal() as db:
         # Load prospect
         result = await db.execute(
             select(Prospect).where(Prospect.id == prospect_id)
@@ -363,6 +404,10 @@ async def _send_outreach(prospect_id: int) -> dict[str, Any]:
             raw_payload={"gmail_msg_id": gmail_msg_id, "type": "outreach"},
         )
 
+        # Stamp when this outreach was sent — used by follow-up scheduler
+        thread.last_outreach_at = datetime.now(dt_timezone.utc)
+        db.add(thread)
+
         # Update prospect status
         prospect.status = ProspectStatus.CONTACTED.value
         db.add(prospect)
@@ -404,19 +449,19 @@ def cleanup_old_logs(self, days: int = 30) -> dict[str, Any]:
     """
     logger.info(f"[cleanup_old_logs] Pruning logs older than {days} days")
     try:
-        return asyncio.run(_cleanup_old_logs(days))
+        return _run(_cleanup_old_logs(days))
     except Exception as exc:
-        logger.error(f"[cleanup_old_logs] Error: {exc}", exc_info=True)
+        logger.exception("[cleanup_old_logs] Fatal error")
         raise self.retry(exc=exc)
 
 
 async def _cleanup_old_logs(days: int) -> dict[str, Any]:
-    from app.db.session import AsyncSessionLocal
+    from app.db.session import CelerySessionLocal
     from app.models.agent_run import AgentRun
 
     cutoff = datetime.now(dt_timezone.utc) - timedelta(days=days)
 
-    async with AsyncSessionLocal() as db:
+    async with CelerySessionLocal() as db:
         result = await db.execute(
             delete(AgentRun).where(AgentRun.created_at < cutoff)
         )
@@ -427,6 +472,197 @@ async def _cleanup_old_logs(days: int) -> dict[str, Any]:
     return {"deleted_count": deleted}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 5: Follow-Up Silent Prospects
+# ─────────────────────────────────────────────────────────────────────────────
+
+@celery_app.task(
+    bind=True,
+    base=BaseTask,
+    name="app.workers.tasks.follow_up_silent_prospects",
+    queue="gmail",
+    soft_time_limit=300,
+    time_limit=420,
+)
+def follow_up_silent_prospects(self) -> dict[str, Any]:
+    """
+    Celery Beat task — runs daily at 08:00 UTC.
+
+    Finds all contacted threads that have not received a reply within
+    `follow_up_days` days and still have remaining follow-up attempts.
+    Generates a personalised follow-up email via LLM and sends it.
+
+    Returns:
+        {checked, followed_up, skipped, errors}
+    """
+    logger.info("[follow_up_silent_prospects] Starting silent prospect scan")
+    try:
+        return _run(_follow_up_silent_prospects())
+    except Exception as exc:
+        logger.exception("[follow_up_silent_prospects] Fatal error")
+        raise self.retry(exc=exc, countdown=300)
+
+
+async def _follow_up_silent_prospects() -> dict[str, Any]:
+    from datetime import timedelta
+
+    from sqlalchemy import and_
+
+    from app.core.config import settings
+    from app.db.session import CelerySessionLocal
+    from app.models.email_thread import EmailThread, ThreadStatus
+    from app.models.prospect import Prospect, ProspectStatus
+    from app.repositories.config_repo import get_or_create_default
+    from app.services.gmail_service import reply_to_thread, send_email as gmail_send
+    from app.services.llm_service import generate_followup_email
+    from app.services.memory_service import save_message
+
+    checked = 0
+    followed_up = 0
+    skipped = 0
+    errors = 0
+
+    async with CelerySessionLocal() as db:
+        config = await get_or_create_default(db)
+        follow_up_days: int = getattr(config, "follow_up_days", 3)
+        max_follow_ups: int = getattr(config, "max_follow_ups", 2)
+        cutoff = datetime.now(dt_timezone.utc) - timedelta(days=follow_up_days)
+
+        # Find threads that are still in PENDING/ACTIVE status (agent never ran),
+        # or WAITING (agent ran, no reply since), were last contacted before cutoff,
+        # and still have follow-ups remaining.
+        result = await db.execute(
+            select(EmailThread).where(
+                and_(
+                    EmailThread.status.in_([
+                        ThreadStatus.PENDING.value,
+                        ThreadStatus.WAITING.value,
+                    ]),
+                    EmailThread.last_outreach_at <= cutoff,
+                    EmailThread.last_outreach_at.isnot(None),
+                    EmailThread.follow_up_count < max_follow_ups,
+                )
+            )
+        )
+        silent_threads = result.scalars().all()
+
+    logger.info(
+        f"[follow_up] Found {len(silent_threads)} silent thread(s) "
+        f"(cutoff={cutoff.date()} max_follow_ups={max_follow_ups})"
+    )
+
+    for thread in silent_threads:
+        checked += 1
+        try:
+            async with CelerySessionLocal() as db:
+                # Re-fetch config and prospect freshly per thread
+                config = await get_or_create_default(db)
+                prospect_result = await db.execute(
+                    select(Prospect).where(Prospect.id == thread.prospect_id)
+                )
+                prospect = prospect_result.scalar_one_or_none()
+                if not prospect:
+                    logger.warning(f"[follow_up] Prospect not found for thread {thread.id}")
+                    skipped += 1
+                    continue
+
+                follow_up_number = thread.follow_up_count + 1
+                days_since = (
+                    datetime.now(dt_timezone.utc) - thread.last_outreach_at
+                ).days
+
+                logger.info(
+                    f"[follow_up] Sending follow-up #{follow_up_number} "
+                    f"to {prospect.email} | thread={thread.id} "
+                    f"days_since_last={days_since}"
+                )
+
+                # Generate follow-up via LLM
+                draft = generate_followup_email(
+                    prospect_name=prospect.name,
+                    original_subject=thread.subject,
+                    gig_description=config.gig_description or "an exciting opportunity",
+                    days_since=days_since,
+                    follow_up_number=follow_up_number,
+                    max_follow_ups=getattr(config, "max_follow_ups", 2),
+                    tone=config.tone,
+                )
+
+                # Send via Gmail — reply on the same thread if possible,
+                # otherwise start fresh
+                try:
+                    sent_msg = reply_to_thread(
+                        thread_id=thread.gmail_thread_id,
+                        body=draft.body,
+                        subject=draft.subject,
+                        to=prospect.email,
+                    )
+                    gmail_thread_id = sent_msg.thread_id
+                except Exception as reply_exc:
+                    logger.warning(
+                        f"[follow_up] reply_to_thread failed ({reply_exc}) "
+                        "— sending as new email"
+                    )
+                    sent_msg = gmail_send(
+                        to=prospect.email,
+                        subject=draft.subject,
+                        body=draft.body,
+                    )
+                    gmail_thread_id = sent_msg.thread_id
+
+                # Persist the follow-up message and update thread counters
+                await save_message(
+                    db=db,
+                    thread_id=thread.id,
+                    sender="agent",
+                    body=draft.body,
+                    timestamp=datetime.now(dt_timezone.utc),
+                    raw_payload={
+                        "type": "follow_up",
+                        "follow_up_number": follow_up_number,
+                        "gmail_msg_id": sent_msg.message_id,
+                    },
+                )
+
+                thread.follow_up_count = follow_up_number
+                thread.last_outreach_at = datetime.now(dt_timezone.utc)
+                db.add(thread)
+
+                # If max follow-ups reached, mark thread as CLOSED
+                if follow_up_number >= getattr(config, "max_follow_ups", 2):
+                    thread.status = ThreadStatus.CLOSED.value
+                    prospect.status = ProspectStatus.DECLINED.value
+                    db.add(prospect)
+                    logger.info(
+                        f"[follow_up] Max follow-ups reached — closing thread {thread.id} "
+                        f"prospect={prospect.email}"
+                    )
+
+                await db.commit()
+                followed_up += 1
+
+                logger.info(
+                    f"[follow_up] Sent follow-up #{follow_up_number} "
+                    f"to {prospect.email} | msg={sent_msg.message_id}"
+                )
+
+        except Exception as thread_exc:
+            logger.exception(f"[follow_up] Error on thread {thread.id}")
+            errors += 1
+            continue
+
+    logger.info(
+        f"[follow_up] Done | checked={checked} followed_up={followed_up} "
+        f"skipped={skipped} errors={errors}"
+    )
+    return {
+        "checked": checked,
+        "followed_up": followed_up,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_name(email: str) -> str:
@@ -434,6 +670,21 @@ def _extract_name(email: str) -> str:
     local = email.split("@")[0]
     name = local.replace(".", " ").replace("_", " ").replace("-", " ").title()
     return name or email
+
+
+def _parse_email_address(raw: str) -> str:
+    """
+    Extract bare email address from Gmail 'From' header.
+
+    Examples:
+        'John Doe <john@example.com>'  → 'john@example.com'
+        'john@example.com'             → 'john@example.com'
+        'John Doe <john@example.com> ' → 'john@example.com'
+    """
+    raw = raw.strip()
+    if "<" in raw and ">" in raw:
+        return raw[raw.index("<") + 1 : raw.index(">")].strip().lower()
+    return raw.lower()
 
 
 async def _message_already_saved(db: Any, thread_id: int, gmail_msg_id: str) -> bool:

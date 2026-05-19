@@ -5,23 +5,28 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 from app.core.logging import logger
 
-# asyncpg requires ssl=True for Supabase connections
+# Supabase connection args:
+#   ssl=require       — mandatory for all Supabase endpoints
+#   statement_cache_size=0 — required for Transaction mode pooler (port 6543);
+#                            prepared statements can't survive across connections
 _connect_args = {}
 if "supabase.co" in settings.DATABASE_URL:
-    _connect_args = {"ssl": "require"}
+    _connect_args = {"ssl": "require", "statement_cache_size": 0}
 
+# NullPool: every session opens a fresh connection and closes it on exit.
+# This is the safest strategy for Supabase free-tier (15-connection cap) when
+# both FastAPI handlers and Celery workers (each running in their own event
+# loop) share the same database.  The tiny per-request overhead is negligible
+# compared to hitting the connection limit.
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-    pool_recycle=1800,
-    pool_pre_ping=True,
+    poolclass=NullPool,
     connect_args=_connect_args,
 )
 
@@ -32,6 +37,9 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
     autocommit=False,
 )
+
+# Alias used by Celery tasks — same engine/pool so the name is clear at callsite
+CelerySessionLocal = AsyncSessionLocal
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

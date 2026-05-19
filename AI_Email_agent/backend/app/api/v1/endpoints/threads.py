@@ -147,7 +147,7 @@ async def run_agent_for_thread(
                 ),
             }
         except Exception as inline_exc:
-            logger.error(f"Inline agent run failed: {inline_exc}", exc_info=True)
+            logger.exception("Inline agent run failed")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Agent run failed: {inline_exc}",

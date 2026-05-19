@@ -109,9 +109,7 @@ async def send_reply(state: AgentState) -> AgentState:
         return {**state, "reply_sent": True}
 
     except Exception as exc:
-        logger.error(
-            f"[send_reply] thread={thread_id} send failed: {exc}", exc_info=True
-        )
+        logger.exception(f"[send_reply] thread={thread_id} send failed")
         return {
             **state,
             "reply_sent": False,

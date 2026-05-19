@@ -15,9 +15,10 @@ venv/
 .venv/
 env/
 
-# Environment files
+# Environment files — copy .env.example and fill in your own values
 .env
 *.env
+!.env.example
 
 # IDE
 .idea/
@@ -25,17 +26,26 @@ env/
 *.swp
 *.swo
 
-# Alembic
+# Alembic generated migrations (DB already set up on Supabase)
 alembic/versions/
 
 # Google OAuth credentials & tokens — NEVER commit these
 credentials/
 *_credentials.json
 *_token.json
+client_secret_*.json
 
-# Logs
+# Logs (runtime generated)
 *.log
 logs/
+
+# Celery Beat runtime files
+celerybeat-schedule.*
+
+# Node / React frontend
+node_modules/
+frontend_react/dist/
+frontend_react/.env.local
 
 # Docker
 .dockerignore
@@ -43,3 +53,4 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini

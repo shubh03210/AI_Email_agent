@@ -346,3 +346,35 @@ def generate_outreach_email(
         ),
         output_schema=EmailDraft,
     )
+
+
+def generate_followup_email(
+    prospect_name: str,
+    original_subject: str,
+    gig_description: str,
+    days_since: int,
+    follow_up_number: int,
+    max_follow_ups: int,
+    tone: str = "professional",
+    agent_name: str = "Alex",
+) -> EmailDraft:
+    """Generate a follow-up email for a prospect who has not replied."""
+    from app.agents.prompts import FOLLOWUP_SYSTEM, FOLLOWUP_USER
+
+    llm = get_llm_service()
+    return llm.generate_structured(
+        system_prompt=FOLLOWUP_SYSTEM.format(
+            agent_name=agent_name,
+            follow_up_number=follow_up_number,
+            tone=tone,
+        ),
+        user_message=FOLLOWUP_USER.format(
+            prospect_name=prospect_name,
+            original_subject=original_subject,
+            days_since=days_since,
+            follow_up_number=follow_up_number,
+            max_follow_ups=max_follow_ups,
+            gig_description=gig_description,
+        ),
+        output_schema=EmailDraft,
+    )

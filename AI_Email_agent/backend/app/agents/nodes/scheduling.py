@@ -136,7 +136,7 @@ async def scheduling(state: AgentState) -> AgentState:
         }
 
     except Exception as exc:
-        logger.error(f"[scheduling] thread={thread_id} error={exc}", exc_info=True)
+        logger.exception(f"[scheduling] thread={thread_id} failed")
         return {
             **state,
             "available_slots": [],

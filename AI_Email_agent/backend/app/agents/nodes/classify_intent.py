@@ -91,9 +91,7 @@ async def classify_intent(state: AgentState) -> AgentState:
         return updates
 
     except Exception as exc:
-        logger.error(
-            f"[classify_intent] thread={thread_id} error={exc}", exc_info=True
-        )
+        logger.exception(f"[classify_intent] thread={thread_id} failed")
         return {
             **state,
             "intent": "ambiguous",

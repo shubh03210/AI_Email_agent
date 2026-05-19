@@ -189,7 +189,7 @@ async def rescheduling(state: AgentState) -> AgentState:
         }
 
     except Exception as exc:
-        logger.error(f"[rescheduling] thread={thread_id} error={exc}", exc_info=True)
+        logger.exception(f"[rescheduling] thread={thread_id} failed")
         return {
             **state,
             "reply_instruction": (

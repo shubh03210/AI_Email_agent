@@ -79,9 +79,7 @@ async def reply_generation(state: AgentState) -> AgentState:
         }
 
     except Exception as exc:
-        logger.error(
-            f"[reply_generation] thread={thread_id} error={exc}", exc_info=True
-        )
+        logger.exception(f"[reply_generation] thread={thread_id} failed")
         # Hard fallback — never leave reply_body empty; send_reply skips on empty.
         fallback_body = (
             "Thanks for getting back to me. "

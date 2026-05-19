@@ -169,9 +169,8 @@ async def trigger_outreach(
             f"Celery unavailable ({celery_exc}) — running outreach inline for prospect {prospect_id}"
         )
         try:
-            import asyncio
             from app.workers.tasks import _send_outreach
-            result = asyncio.run(_send_outreach(prospect_id))
+            result = await _send_outreach(prospect_id)
             logger.info(f"Inline outreach done | prospect={prospect_id} result={result}")
             return {
                 "task_id": "inline",
@@ -179,7 +178,7 @@ async def trigger_outreach(
                 "message": f"Outreach sent directly (no Celery). Subject: {result.get('subject', '')}",
             }
         except Exception as inline_exc:
-            logger.error(f"Inline outreach also failed: {inline_exc}", exc_info=True)
+            logger.exception("Inline outreach also failed")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Outreach failed: {inline_exc}",
