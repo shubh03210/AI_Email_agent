@@ -1,23 +1,170 @@
-from fastapi import APIRouter
+"""
+Prospects API
+──────────────
+CRUD endpoints for managing outreach prospects.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.v1.deps import get_db
+from app.core.logging import logger
+from app.repositories import prospect_repo
+from app.schemas.prospect import (
+    ProspectCreate,
+    ProspectListResponse,
+    ProspectRead,
+    ProspectUpdate,
+)
 
 router = APIRouter()
 
 
-@router.get("/")
-async def list_prospects():
-    return []
+@router.get(
+    "/",
+    response_model=ProspectListResponse,
+    summary="List prospects",
+)
+async def list_prospects(
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status"),
+    search: Optional[str] = Query(None, description="Search by name or email"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+) -> ProspectListResponse:
+    items, total = await prospect_repo.list_prospects(
+        db, status=status_filter, search=search, page=page, page_size=page_size
+    )
+    return ProspectListResponse(
+        items=[ProspectRead.model_validate(p) for p in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
-@router.post("/")
-async def create_prospect():
-    pass
+@router.post(
+    "/",
+    response_model=ProspectRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a prospect",
+)
+async def create_prospect(
+    payload: ProspectCreate,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectRead:
+    existing = await prospect_repo.get_by_email(db, payload.email)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Prospect with email '{payload.email}' already exists.",
+        )
+    prospect = await prospect_repo.create(db, payload)
+    logger.info(f"Prospect created | id={prospect.id} email={prospect.email}")
+    return ProspectRead.model_validate(prospect)
 
 
-@router.get("/{prospect_id}")
-async def get_prospect(prospect_id: int):
-    pass
+@router.get(
+    "/{prospect_id}",
+    response_model=ProspectRead,
+    summary="Get a prospect by ID",
+)
+async def get_prospect(
+    prospect_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectRead:
+    prospect = await prospect_repo.get_by_id(db, prospect_id)
+    if not prospect:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Prospect {prospect_id} not found.",
+        )
+    return ProspectRead.model_validate(prospect)
 
 
-@router.delete("/{prospect_id}")
-async def delete_prospect(prospect_id: int):
-    pass
+@router.put(
+    "/{prospect_id}",
+    response_model=ProspectRead,
+    summary="Update a prospect",
+)
+async def update_prospect(
+    prospect_id: int,
+    payload: ProspectUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectRead:
+    prospect = await prospect_repo.get_by_id(db, prospect_id)
+    if not prospect:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Prospect {prospect_id} not found.",
+        )
+    # If email is being changed, check uniqueness
+    if payload.email and payload.email != prospect.email:
+        existing = await prospect_repo.get_by_email(db, payload.email)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Email '{payload.email}' is already used by another prospect.",
+            )
+    prospect = await prospect_repo.update(db, prospect, payload)
+    logger.info(f"Prospect updated | id={prospect.id}")
+    return ProspectRead.model_validate(prospect)
+
+
+@router.delete(
+    "/{prospect_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a prospect",
+)
+async def delete_prospect(
+    prospect_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    prospect = await prospect_repo.get_by_id(db, prospect_id)
+    if not prospect:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Prospect {prospect_id} not found.",
+        )
+    await prospect_repo.delete(db, prospect)
+    logger.info(f"Prospect deleted | id={prospect_id}")
+
+
+@router.post(
+    "/{prospect_id}/outreach",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Trigger cold outreach for a prospect",
+)
+async def trigger_outreach(
+    prospect_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Enqueue a Celery task to generate and send the first outreach email
+    to this prospect. Returns a task ID for polling.
+    """
+    prospect = await prospect_repo.get_by_id(db, prospect_id)
+    if not prospect:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Prospect {prospect_id} not found.",
+        )
+    try:
+        from app.workers.tasks import send_outreach_task
+        task = send_outreach_task.delay(prospect_id=prospect_id)
+        logger.info(f"Outreach task enqueued | prospect_id={prospect_id} task={task.id}")
+        return {
+            "task_id": task.id,
+            "status": "queued",
+            "message": f"Outreach queued for prospect {prospect_id}",
+        }
+    except Exception as exc:
+        logger.error(f"Failed to enqueue outreach task: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enqueue outreach task.",
+        )
