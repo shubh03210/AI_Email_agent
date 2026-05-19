@@ -17,9 +17,14 @@ Async pattern:
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from typing import Any, Optional
+
+# asyncpg requires SelectorEventLoop on Windows
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from celery import Task
 from celery.utils.log import get_task_logger
@@ -75,7 +80,6 @@ async def _poll_inbox() -> dict[str, Any]:
     from app.core.config import settings
     from app.db.session import AsyncSessionLocal
     from app.models.prospect import Prospect, ProspectStatus
-    from app.services.gmail_service import GmailService
     from app.services.memory_service import get_or_create_thread, save_message
 
     processed = 0
@@ -310,7 +314,6 @@ async def _send_outreach(prospect_id: int) -> dict[str, Any]:
     from app.db.session import AsyncSessionLocal
     from app.models.prospect import Prospect, ProspectStatus
     from app.repositories.config_repo import get_or_create_default
-    from app.services.gmail_service import GmailService
     from app.services.llm_service import generate_outreach_email
     from app.services.memory_service import get_or_create_thread, save_message
 
