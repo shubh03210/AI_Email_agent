@@ -24,7 +24,7 @@ from app.agents.state import AgentState
 from app.core.logging import logger
 from app.db.session import AsyncSessionLocal
 from app.models.email_thread import ThreadStatus
-from app.services.gmail_service import GmailService
+from app.services.gmail_service import reply_to_thread
 from app.services.memory_service import save_message, update_thread_status
 
 
@@ -75,12 +75,11 @@ async def send_reply(state: AgentState) -> AgentState:
 
     try:
         # 1 — Send via Gmail
-        gmail = GmailService()
-        gmail.send_reply(
+        reply_to_thread(
+            thread_id=gmail_thread_id,
             to=prospect_email,
             subject=reply_subject,
             body=reply_body,
-            thread_id=gmail_thread_id,
         )
         logger.info(
             f"[send_reply] Email sent to {prospect_email} | thread={thread_id}"
