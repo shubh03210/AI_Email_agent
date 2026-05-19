@@ -3,24 +3,8 @@ version: "3.9"
 services:
 
   # ── PostgreSQL ───────────────────────────────────────────────────────────────
-  postgres:
-    image: postgres:15-alpine
-    container_name: email_agent_postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: email_agent
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d email_agent"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+  # Using Supabase hosted PostgreSQL — no local postgres container needed.
+  # DATABASE_URL in .env points to Supabase directly.
 
   # ── Redis ────────────────────────────────────────────────────────────────────
   redis:
@@ -53,8 +37,6 @@ services:
       - ./backend/credentials:/app/credentials:ro
       - backend_logs:/app/logs
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -82,8 +64,6 @@ services:
       - ./backend/credentials:/app/credentials:ro
       - backend_logs:/app/logs
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -124,7 +104,6 @@ services:
 
 # ── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
-  postgres_data:
   redis_data:
   backend_logs:
   celery_beat_data:
