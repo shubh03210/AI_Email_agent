@@ -1,4 +1,4 @@
-# Email Wakeup Agent
+# AI Email Agent
 
 An AI-powered email agent that automatically handles prospect email threads — classifying intent, negotiating meeting times, scheduling, and generating polished replies.
 
@@ -19,7 +19,7 @@ An AI-powered email agent that automatically handles prospect email threads — 
 ## Project Structure
 
 ```
-email-wakeup-agent/
+AI_Email_agent/
 ├── backend/          # FastAPI app, LangGraph agent, Celery workers
 ├── frontend/         # Streamlit dashboard
 ├── docker-compose.yml
