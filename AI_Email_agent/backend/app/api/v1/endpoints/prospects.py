@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import get_db
@@ -123,7 +123,7 @@ async def update_prospect(
 async def delete_prospect(
     prospect_id: int,
     db: AsyncSession = Depends(get_db),
-) -> None:
+) -> Response:
     prospect = await prospect_repo.get_by_id(db, prospect_id)
     if not prospect:
         raise HTTPException(
@@ -132,6 +132,7 @@ async def delete_prospect(
         )
     await prospect_repo.delete(db, prospect)
     logger.info(f"Prospect deleted | id={prospect_id}")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
@@ -8,7 +12,7 @@ router = APIRouter()
 
 class AgentStartRequest(BaseModel):
     prospect_id: int
-    thread_id: str | None = None
+    thread_id: Optional[int] = None
 
 
 class AgentStartResponse(BaseModel):
@@ -20,35 +24,36 @@ class AgentStartResponse(BaseModel):
 class AgentPollResponse(BaseModel):
     task_id: str
     status: str
-    result: dict | None = None
+    result: Optional[dict] = None
 
 
 @router.post(
     "/start",
     response_model=AgentStartResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Start the agent for a given prospect",
+    summary="Start the agent for a given prospect / thread",
 )
-async def start_agent(payload: AgentStartRequest):
+async def start_agent(payload: AgentStartRequest) -> AgentStartResponse:
     """
-    Enqueues an agent run for the specified prospect.
-    Returns a Celery task ID that can be used to poll status.
+    Enqueues an agent run.
+    If thread_id is supplied the agent runs against that thread directly.
+    Otherwise it enqueues an outreach task for the prospect.
     """
     try:
-        from app.workers.tasks import run_agent_task
+        if payload.thread_id:
+            from app.workers.tasks import run_agent_task
+            task = run_agent_task.delay(thread_id=payload.thread_id)
+            msg = f"Agent run queued for thread {payload.thread_id}"
+        else:
+            from app.workers.tasks import send_outreach_task
+            task = send_outreach_task.delay(prospect_id=payload.prospect_id)
+            msg = f"Outreach queued for prospect {payload.prospect_id}"
 
-        task = run_agent_task.delay(
-            prospect_id=payload.prospect_id,
-            thread_id=payload.thread_id,
-        )
-        logger.info(f"Agent task enqueued: {task.id} for prospect {payload.prospect_id}")
-        return AgentStartResponse(
-            task_id=task.id,
-            status="queued",
-            message=f"Agent started for prospect {payload.prospect_id}",
-        )
+        logger.info(f"Task enqueued: {task.id}")
+        return AgentStartResponse(task_id=task.id, status="queued", message=msg)
+
     except Exception as exc:
-        logger.error(f"Failed to start agent: {exc}")
+        logger.error(f"Failed to enqueue agent task: {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to enqueue agent task.",
@@ -60,10 +65,8 @@ async def start_agent(payload: AgentStartRequest):
     response_model=AgentPollResponse,
     summary="Poll agent task status",
 )
-async def poll_agent(task_id: str):
-    """
-    Returns the current status and result of a running or completed agent task.
-    """
+async def poll_agent(task_id: str) -> AgentPollResponse:
+    """Returns the current status and result of a running or completed agent task."""
     try:
         from app.workers.celery_app import celery_app
         from celery.result import AsyncResult

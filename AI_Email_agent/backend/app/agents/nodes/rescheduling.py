@@ -5,13 +5,12 @@ Handles meeting reschedule requests from the prospect.
 
 Flow:
   1. Cancels the existing Google Calendar event (if any).
-  2. Fetches new available slots.
+  2. Fetches new available slots via calendar_service.get_available_slots().
   3. Uses LLM to pick the best replacement slot.
-  4. Creates a new calendar event.
+  4. Creates a new calendar event via calendar_service.create_event().
   5. Persists the updated meeting record to DB.
   6. Sets reply_instruction for reply_generation.
-  7. If reschedule_count >= MAX_RESCHEDULE_ATTEMPTS, walks away gracefully
-     instead of booking yet another slot.
+  7. If reschedule_count >= MAX_RESCHEDULE_ATTEMPTS, walks away gracefully.
 
 Output keys added to state:
   available_slots, selected_slot, meeting_status, google_event_id,
@@ -23,17 +22,22 @@ from __future__ import annotations
 from datetime import datetime
 from datetime import timezone as dt_timezone
 
-from app.agents.prompts import RESCHEDULE_USER
+from app.agents.prompts import RESCHEDULE_SYSTEM, RESCHEDULE_USER
 from app.agents.state import AgentState
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.session import AsyncSessionLocal
-from app.services.calendar_service import CalendarService
+from app.services.calendar_service import (
+    cancel_event,
+    create_event,
+    get_available_slots,
+    TimeSlot,
+)
 from app.services.llm_service import ReschedulingDecision, get_llm_service
 from app.services.memory_service import (
+    cancel_meeting,
     get_or_create_meeting,
     reschedule_meeting,
-    cancel_meeting,
 )
 
 
@@ -48,13 +52,6 @@ async def rescheduling(state: AgentState) -> AgentState:
     Writes:
         available_slots, selected_slot, meeting_status, google_event_id,
         scheduled_at, reschedule_count, reply_instruction
-
-    On max reschedule attempts:
-        Sets meeting_status to 'cancelled' and a polite walkaway
-        reply_instruction.
-
-    On error:
-        Sets error + error_node.
     """
     thread_id = state.get("thread_id")
     conversation_text = state.get("conversation_text", "")
@@ -92,12 +89,10 @@ async def rescheduling(state: AgentState) -> AgentState:
         }
 
     try:
-        cal = CalendarService()
-
-        # 1 — Cancel existing event
+        # 1 — Cancel the existing Google Calendar event
         if existing_event_id:
             try:
-                cal.cancel_event(existing_event_id)
+                cancel_event(existing_event_id)
                 logger.info(
                     f"[rescheduling] Cancelled event {existing_event_id} "
                     f"for thread {thread_id}"
@@ -109,8 +104,8 @@ async def rescheduling(state: AgentState) -> AgentState:
                 )
 
         # 2 — Fetch new slots
-        slots = _get_slots(cal, prospect_timezone)
-        if not slots:
+        raw_slots: list[TimeSlot] = _fetch_slots(prospect_timezone)
+        if not raw_slots:
             return {
                 **state,
                 "reply_instruction": (
@@ -121,11 +116,13 @@ async def rescheduling(state: AgentState) -> AgentState:
                 "error_node": "rescheduling",
             }
 
-        # 3 — LLM picks the best new slot
+        slots = _slots_to_dicts(raw_slots)
         slots_text = _format_slots_text(slots)
+
+        # 3 — LLM picks the best new slot
         llm = get_llm_service()
         decision: ReschedulingDecision = llm.generate_structured(
-            system_prompt=_build_reschedule_system(),
+            system_prompt=RESCHEDULE_SYSTEM,
             user_message=RESCHEDULE_USER.format(
                 conversation_text=conversation_text,
                 prospect_timezone=prospect_timezone,
@@ -133,39 +130,45 @@ async def rescheduling(state: AgentState) -> AgentState:
                 reschedule_count=reschedule_count,
                 slots_text=slots_text,
                 selected_slot_index=0,
-                selected_slot_dt=slots[0].get("start", ""),
+                selected_slot_dt=slots[0]["start"],
             ),
             output_schema=ReschedulingDecision,
         )
 
-        idx = max(0, min(decision.new_slot_index, len(slots) - 1))
-        chosen_slot = slots[idx]
-        slot_start: str = chosen_slot.get("start", "")
+        idx = max(0, min(decision.new_slot_index, len(raw_slots) - 1))
+        chosen_slot = raw_slots[idx]
+        chosen_dict = slots[idx]
 
         logger.info(
-            f"[rescheduling] New slot index={idx} start={slot_start} "
+            f"[rescheduling] New slot index={idx} start={chosen_dict['start']} "
             f"thread={thread_id}"
         )
 
-        # 4 — Create new calendar event
-        event_id, event_link = await _create_event(
-            cal, chosen_slot, prospect_name, prospect_email
+        # 4 — Create new Google Calendar event
+        event = create_event(
+            summary=f"Rescheduled: Intro call with {prospect_name}",
+            description="Rescheduled introduction call — AI Email Agent.",
+            start=chosen_slot.start,
+            attendee_emails=[prospect_email] if prospect_email else [],
+            duration_minutes=30,
+            tz_name="UTC",
+            add_meet_link=True,
         )
+        event_id: str = event.event_id
+        meet_link: str = event.meet_link or event.html_link or ""
 
         # 5 — Persist to DB
-        scheduled_dt = _parse_iso(slot_start)
+        new_count = reschedule_count + 1
         async with AsyncSessionLocal() as db:
             meeting = await get_or_create_meeting(db, thread_id)
-            await reschedule_meeting(db, meeting, event_id, scheduled_dt)
+            await reschedule_meeting(db, meeting, event_id, chosen_slot.start)
             await db.commit()
-
-        new_count = reschedule_count + 1
 
         # 6 — Build reply instruction
         reply_instruction = (
             f"{decision.apology_message} "
             f"Propose the new time: {_human_readable_slot(chosen_slot, prospect_timezone)}. "
-            f"Include the Google Meet link: {event_link}. "
+            f"Include the Google Meet link: {meet_link}. "
             "Ask them to confirm and note a new calendar invite is on its way."
         )
         if new_count >= max_attempts - 1:
@@ -177,18 +180,16 @@ async def rescheduling(state: AgentState) -> AgentState:
         return {
             **state,
             "available_slots": slots,
-            "selected_slot": chosen_slot,
+            "selected_slot": chosen_dict,
             "meeting_status": "rescheduled",
             "google_event_id": event_id,
-            "scheduled_at": slot_start,
+            "scheduled_at": chosen_slot.start.isoformat(),
             "reschedule_count": new_count,
             "reply_instruction": reply_instruction,
         }
 
     except Exception as exc:
-        logger.error(
-            f"[rescheduling] thread={thread_id} error={exc}", exc_info=True
-        )
+        logger.error(f"[rescheduling] thread={thread_id} error={exc}", exc_info=True)
         return {
             **state,
             "reply_instruction": (
@@ -202,71 +203,43 @@ async def rescheduling(state: AgentState) -> AgentState:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_slots(cal: CalendarService, tz_name: str) -> list[dict]:
+def _fetch_slots(tz_name: str) -> list[TimeSlot]:
     try:
-        slots = cal.get_free_slots(
+        return get_available_slots(
             duration_minutes=30,
             days_ahead=5,
+            tz_name=tz_name,
             working_hours_start=settings.AGENT_DEFAULT_WORKING_HOURS_START,
             working_hours_end=settings.AGENT_DEFAULT_WORKING_HOURS_END,
-            tz_name=tz_name,
+            max_slots=8,
         )
-        return slots[:8]
     except Exception as exc:
         logger.error(f"[rescheduling] calendar fetch error: {exc}")
         return []
 
 
-async def _create_event(
-    cal: CalendarService,
-    slot: dict,
-    prospect_name: str,
-    prospect_email: str,
-) -> tuple[str, str]:
-    result = cal.create_event(
-        title=f"Rescheduled: Intro call with {prospect_name}",
-        start_iso=slot["start"],
-        end_iso=slot["end"],
-        attendee_email=prospect_email,
-        description="Rescheduled introduction call — AI Email Agent.",
-        add_meet_link=True,
-    )
-    event_id: str = result.get("id", "")
-    meet_link = ""
-    for ep in result.get("conferenceData", {}).get("entryPoints", []):
-        if ep.get("entryPointType") == "video":
-            meet_link = ep.get("uri", "")
-            break
-    return event_id, meet_link or result.get("htmlLink", "")
+def _slots_to_dicts(slots: list[TimeSlot]) -> list[dict]:
+    return [
+        {"start": s.start.isoformat(), "end": s.end.isoformat()}
+        for s in slots
+    ]
 
 
 def _format_slots_text(slots: list[dict]) -> str:
     return "\n".join(
-        f"  [{i}] {s.get('start', '')} → {s.get('end', '')}"
+        f"  [{i}] {s['start']} → {s['end']}"
         for i, s in enumerate(slots)
     )
 
 
-def _human_readable_slot(slot: dict, tz_name: str) -> str:
+def _human_readable_slot(slot: TimeSlot, tz_name: str) -> str:
+    """Return a human-readable slot string (cross-platform, no %-d)."""
     try:
-        import zoneinfo
-        tz = zoneinfo.ZoneInfo(tz_name)
-        dt = _parse_iso(slot["start"]).astimezone(tz)
-        return dt.strftime("%A, %B %-d at %-I:%M %p %Z")
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+        dt = slot.start.astimezone(tz)
+        day = str(dt.day)
+        hour = dt.strftime("%I").lstrip("0") or "12"
+        return dt.strftime(f"%A, %B {day} at {hour}:%M %p %Z")
     except Exception:
-        return slot.get("start", "TBD")
-
-
-def _parse_iso(iso_str: str) -> datetime:
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=dt_timezone.utc)
-        return dt
-    except Exception:
-        return datetime.now(dt_timezone.utc)
-
-
-def _build_reschedule_system() -> str:
-    from app.agents.prompts import RESCHEDULE_SYSTEM
-    return RESCHEDULE_SYSTEM
+        return slot.start.isoformat()

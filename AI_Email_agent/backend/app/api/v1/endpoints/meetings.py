@@ -87,8 +87,8 @@ async def cancel_meeting(
     # Best-effort Google Calendar cancellation
     if meeting.google_event_id:
         try:
-            from app.services.calendar_service import CalendarService
-            CalendarService().cancel_event(meeting.google_event_id)
+            from app.services.calendar_service import cancel_event
+            cancel_event(meeting.google_event_id)
             logger.info(
                 f"GCal event {meeting.google_event_id} cancelled | meeting={meeting_id}"
             )
