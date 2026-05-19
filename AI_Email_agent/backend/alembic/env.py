@@ -2,30 +2,23 @@ import os
 import sys
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 from alembic import context
 
 # ── Make sure app package is importable ──────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── Load .env before importing settings ─────────────────────────────────────
+# ── Load .env before importing settings ──────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
-# ── Import settings and all models so metadata is populated ─────────────────
+# ── Import settings and all models so metadata is populated ──────────────────
 from app.core.config import settings
 import app.db.init_db  # noqa: F401 — registers all models
 from app.db.base import Base
 
-# ── Alembic config object ────────────────────────────────────────────────────
+# ── Alembic config object ─────────────────────────────────────────────────────
 config = context.config
-
-# Build a synchronous DATABASE_URL for Alembic
-# asyncpg → psycopg2
-sync_url = settings.DATABASE_URL.replace(
-    "postgresql+asyncpg://", "postgresql://"
-)
-config.set_main_option("sqlalchemy.url", sync_url)
 
 # Setup loggers from alembic.ini
 if config.config_file_name is not None:
@@ -33,12 +26,15 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+# Build a synchronous DATABASE_URL for Alembic
+# asyncpg → psycopg2  (do NOT pass through configparser — % causes ValueError)
+sync_url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode (no DB connection)."""
-    url = config.get_main_option("sqlalchemy.url")
+    """Run migrations without a live DB connection (generates SQL only)."""
     context.configure(
-        url=url,
+        url=sync_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -49,10 +45,9 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode (live DB connection)."""
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    """Run migrations against a live DB connection."""
+    connectable = create_engine(
+        sync_url,
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
