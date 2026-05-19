@@ -1,14 +1,48 @@
+# API
 fastapi
 uvicorn[standard]
+python-multipart
+email-validator
+
+# Pydantic
+pydantic
 pydantic-settings
+
+# Database
+sqlalchemy
 sqlalchemy[asyncio]
+psycopg2-binary
 asyncpg
 alembic
+
+# LangChain / LangGraph
+langchain
+langgraph
+langchain-groq
+
+# LLM Providers
+groq
+
+# Google APIs
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+# Task Queue
+redis
+celery
+celery[redis]
+
+# Auth / Security
 python-jose[cryptography]
 passlib[bcrypt]
-celery[redis]
-langgraph
-langchain-openai
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
+
+# Utilities
+python-dotenv
+httpx
+loguru
+
+# Testing
+pytest
+pytest-asyncio
