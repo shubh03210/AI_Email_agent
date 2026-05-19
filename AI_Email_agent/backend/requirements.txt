@@ -42,6 +42,8 @@ python-dotenv
 httpx
 loguru
 tenacity
+typing_extensions
+tzdata
 
 # ── Testing ────────────────────────────────────────────────────────────────────
 pytest
