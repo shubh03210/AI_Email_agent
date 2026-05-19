@@ -266,7 +266,7 @@ if page == "🏠 Dashboard":
 
     with right:
         st.subheader("Prospect Pipeline")
-        all_prospects, _ = get_items("/prospects/", {"page_size": 200})
+        all_prospects, _ = get_items("/prospects/", {"page_size": 100})
         if all_prospects:
             try:
                 import plotly.express as px

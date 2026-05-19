@@ -15,6 +15,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
     logger.info(f"Environment: {'debug' if settings.DEBUG else 'production'}")
     logger.info(f"Docs: http://localhost:8000{settings.API_V1_STR}/docs")
+
+    # Register ALL SQLAlchemy models so relationship strings resolve at startup,
+    # not lazily on first request (which causes mapper initialization errors).
+    import app.db.init_db  # noqa: F401
+
     yield
     logger.info(f"Shutting down {settings.PROJECT_NAME}")
 
