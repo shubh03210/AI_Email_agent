@@ -425,7 +425,7 @@ elif page == "👥 Prospects":
     # ── Tab: Edit ─────────────────────────────────────────────────────────────
     with tab_edit:
         st.subheader("Edit Prospect")
-        all_p, _ = get_items("/prospects/", {"page_size": 200})
+        all_p, _ = get_items("/prospects/", {"page_size": 100})
 
         if not all_p:
             st.info("No prospects to edit.")
@@ -606,7 +606,7 @@ elif page == "📅 Meetings":
     else:
         # Summary metrics
         sm1, sm2, sm3, sm4 = st.columns(4)
-        all_meet, _ = get_items("/meetings/", {"page_size": 200})
+        all_meet, _ = get_items("/meetings/", {"page_size": 100})
         statuses = [m.get("status", "") for m in all_meet]
         sm1.metric("Confirmed",   statuses.count("confirmed"))
         sm2.metric("Proposed",    statuses.count("proposed"))

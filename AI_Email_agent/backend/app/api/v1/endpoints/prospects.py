@@ -154,6 +154,7 @@ async def trigger_outreach(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Prospect {prospect_id} not found.",
         )
+    # Try Celery first; fall back to direct async execution when Redis is unavailable
     try:
         from app.workers.tasks import send_outreach_task
         task = send_outreach_task.delay(prospect_id=prospect_id)
@@ -163,9 +164,23 @@ async def trigger_outreach(
             "status": "queued",
             "message": f"Outreach queued for prospect {prospect_id}",
         }
-    except Exception as exc:
-        logger.error(f"Failed to enqueue outreach task: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to enqueue outreach task.",
+    except Exception as celery_exc:
+        logger.warning(
+            f"Celery unavailable ({celery_exc}) — running outreach inline for prospect {prospect_id}"
         )
+        try:
+            import asyncio
+            from app.workers.tasks import _send_outreach
+            result = asyncio.run(_send_outreach(prospect_id))
+            logger.info(f"Inline outreach done | prospect={prospect_id} result={result}")
+            return {
+                "task_id": "inline",
+                "status": "sent",
+                "message": f"Outreach sent directly (no Celery). Subject: {result.get('subject', '')}",
+            }
+        except Exception as inline_exc:
+            logger.error(f"Inline outreach also failed: {inline_exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Outreach failed: {inline_exc}",
+            )

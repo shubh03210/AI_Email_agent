@@ -116,6 +116,7 @@ async def run_agent_for_thread(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Thread {thread_id} not found.",
         )
+    # Try Celery first; fall back to direct async execution when Redis is unavailable
     try:
         from app.workers.tasks import run_agent_task
         task = run_agent_task.delay(thread_id=thread_id)
@@ -125,12 +126,32 @@ async def run_agent_for_thread(
             "status": "queued",
             "message": f"Agent run queued for thread {thread_id}",
         }
-    except Exception as exc:
-        logger.error(f"Failed to enqueue agent run: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to enqueue agent run task.",
+    except Exception as celery_exc:
+        logger.warning(
+            f"Celery unavailable ({celery_exc}) — running agent inline for thread {thread_id}"
         )
+        try:
+            from app.agents.graph import run_agent
+            final_state = await run_agent(thread_id)
+            logger.info(
+                f"Inline agent run done | thread={thread_id} "
+                f"intent={final_state.get('intent')} reply_sent={final_state.get('reply_sent')}"
+            )
+            return {
+                "task_id": "inline",
+                "status": "completed",
+                "message": (
+                    f"Agent ran directly (no Celery). "
+                    f"Intent: {final_state.get('intent')} | "
+                    f"Reply sent: {final_state.get('reply_sent')}"
+                ),
+            }
+        except Exception as inline_exc:
+            logger.error(f"Inline agent run failed: {inline_exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Agent run failed: {inline_exc}",
+            )
 
 
 @router.get(
