@@ -80,15 +80,13 @@ async def reply_generation(state: AgentState) -> AgentState:
 
     except Exception as exc:
         logger.exception(f"[reply_generation] thread={thread_id} failed")
-        # Hard fallback — never leave reply_body empty; send_reply skips on empty.
-        fallback_body = (
-            "Thanks for getting back to me. "
-            "I'll review your message and respond shortly.\n\nBest,\nAlex"
-        )
+        # Leave reply_body empty so send_reply skips this run entirely.
+        # Sending a blind fallback email when the LLM is down (e.g. rate limit)
+        # causes spam loops — it is safer to silently drop this cycle.
         return {
             **state,
-            "reply_subject": state.get("subject", "Re: Following up"),
-            "reply_body": fallback_body,
+            "reply_subject": "",
+            "reply_body": "",
             "error": str(exc),
             "error_node": "reply_generation",
         }

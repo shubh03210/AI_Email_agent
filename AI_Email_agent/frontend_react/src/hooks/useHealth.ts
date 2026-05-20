@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { healthApi } from '../api/client'
 
 export function useHealth() {
-  const [health, setHealth] = useState<{ status: string; version: string; db: string } | null>(null)
+  const [health, setHealth] = useState<{ status: string; version: string; db: string; redis?: string } | null>(null)
 
   useEffect(() => {
     const check = () => healthApi.check().then(setHealth).catch(() => setHealth(null))

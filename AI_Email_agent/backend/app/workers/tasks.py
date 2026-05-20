@@ -123,15 +123,18 @@ async def _poll_inbox() -> dict[str, Any]:
             logger.info("[poll_inbox] No prospects configured — nothing to poll.")
             return {"processed": 0, "enqueued": 0, "errors": 0}
 
-        # Gmail q= "from:a@b.com OR from:c@d.com ... is:unread"
-        # Gmail API has a URL length limit; chunk at 30 emails per query
+        # Gmail q= "from:a@b.com OR from:c@d.com ... newer_than:3d"
+        # We use a 3-day recency window instead of "is:unread" so that messages
+        # the user already opened in Gmail are still picked up.  Idempotency is
+        # guaranteed by _message_already_saved() checking gmail_msg_id in our DB.
+        # Gmail API has a URL length limit; chunk at 30 emails per query.
         messages_raw = []
         seen_msg_ids: set[str] = set()
         chunk_size = 30
         for i in range(0, len(prospect_emails), chunk_size):
             chunk = prospect_emails[i : i + chunk_size]
             q_parts = [f"from:{e}" for e in chunk]
-            q = "(" + " OR ".join(q_parts) + ") is:unread"
+            q = "(" + " OR ".join(q_parts) + ") newer_than:3d"
             chunk_msgs = fetch_unread_messages(max_results=100, q=q)
             for m in chunk_msgs:
                 if m.message_id not in seen_msg_ids:
@@ -156,7 +159,7 @@ async def _poll_inbox() -> dict[str, Any]:
     ]
 
     if not messages:
-        logger.info("[poll_inbox] No unread replies from known prospects.")
+        logger.info("[poll_inbox] No new replies from known prospects in the last 3 days.")
         return {"processed": 0, "enqueued": 0, "errors": 0}
 
     logger.info(f"[poll_inbox] Found {len(messages)} message(s) from known prospects")
@@ -225,17 +228,19 @@ async def _poll_inbox() -> dict[str, Any]:
                     )
                     processed += 1
 
-                # Enqueue agent run for this thread (deduplicate per poll cycle)
-                if thread.id not in enqueued_thread_ids:
-                    run_agent_task.apply_async(
-                        kwargs={"thread_id": thread.id},
-                        queue="agent",
-                    )
-                    enqueued_thread_ids.add(thread.id)
-                    enqueued += 1
-                    logger.info(
-                        f"[poll_inbox] Enqueued agent run for thread {thread.id}"
-                    )
+                    # Only enqueue the agent when this specific message is new.
+                    # Deduplicate per poll cycle so multiple new messages in the
+                    # same thread trigger only one agent run.
+                    if thread.id not in enqueued_thread_ids:
+                        run_agent_task.apply_async(
+                            kwargs={"thread_id": thread.id},
+                            queue="agent",
+                        )
+                        enqueued_thread_ids.add(thread.id)
+                        enqueued += 1
+                        logger.info(
+                            f"[poll_inbox] Enqueued agent run for thread {thread.id}"
+                        )
 
                 # Mark message as read in Gmail
                 try:

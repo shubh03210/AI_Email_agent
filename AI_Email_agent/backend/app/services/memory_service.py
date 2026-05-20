@@ -188,6 +188,9 @@ async def get_or_create_thread(
     """
     Fetch an existing thread by Gmail thread ID, or create a new one.
 
+    Handles UniqueConstraint races by re-fetching on IntegrityError so a
+    duplicate insert by a concurrent task never crashes the poll loop.
+
     Args:
         db:              Async DB session.
         gmail_thread_id: Gmail's thread ID string.
@@ -197,24 +200,38 @@ async def get_or_create_thread(
     Returns:
         EmailThread ORM instance.
     """
+    from sqlalchemy.exc import IntegrityError
+
     result = await db.execute(
         select(EmailThread).where(EmailThread.gmail_thread_id == gmail_thread_id)
     )
     thread = result.scalar_one_or_none()
 
     if thread is None:
-        thread = EmailThread(
-            gmail_thread_id=gmail_thread_id,
-            prospect_id=prospect_id,
-            subject=subject,
-            status=ThreadStatus.PENDING.value,
-        )
-        db.add(thread)
-        await db.flush()
-        logger.info(
-            f"Thread created | gmail_thread_id={gmail_thread_id} "
-            f"prospect_id={prospect_id} id={thread.id}"
-        )
+        try:
+            thread = EmailThread(
+                gmail_thread_id=gmail_thread_id,
+                prospect_id=prospect_id,
+                subject=subject,
+                status=ThreadStatus.PENDING.value,
+            )
+            db.add(thread)
+            await db.flush()
+            logger.info(
+                f"Thread created | gmail_thread_id={gmail_thread_id} "
+                f"prospect_id={prospect_id} id={thread.id}"
+            )
+        except IntegrityError:
+            # Another concurrent task already inserted this thread — roll back
+            # the savepoint and re-fetch the existing row.
+            await db.rollback()
+            result = await db.execute(
+                select(EmailThread).where(EmailThread.gmail_thread_id == gmail_thread_id)
+            )
+            thread = result.scalar_one()
+            logger.debug(
+                f"Thread race resolved (re-fetched) | gmail_thread_id={gmail_thread_id} id={thread.id}"
+            )
 
     return thread
 

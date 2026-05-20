@@ -24,6 +24,7 @@ from app.agents.state import AgentState
 from app.core.logging import logger
 from app.db.session import AsyncSessionLocal
 from app.models.email_thread import ThreadStatus
+from app.models.prospect import ProspectStatus
 from app.services.gmail_service import reply_to_thread
 from app.services.memory_service import save_message, update_thread_status
 
@@ -65,10 +66,12 @@ async def send_reply(state: AgentState) -> AgentState:
         logger.warning(f"[send_reply] Empty reply_body — skipping send. thread={thread_id}")
         return {**state, "reply_sent": False}
 
-    # Guard: upstream hard failure (error set, intent never resolved)
-    if error and intent == "unknown":
+    # Guard: upstream LLM failure — skip if either intent classification or
+    # reply generation errored out (reply_body would be empty/junk).
+    error_node = state.get("error_node", "")
+    if error and error_node in ("classify_intent", "reply_generation", "run_agent"):
         logger.warning(
-            f"[send_reply] Skipping send due to upstream error: {error}. "
+            f"[send_reply] Skipping send — LLM error in {error_node!r}: {error}. "
             f"thread={thread_id}"
         )
         return {**state, "reply_sent": False}
@@ -85,7 +88,7 @@ async def send_reply(state: AgentState) -> AgentState:
             f"[send_reply] Email sent to {prospect_email} | thread={thread_id}"
         )
 
-        # 2 — Persist outbound message
+        # 2 — Persist outbound message + update thread & prospect statuses
         async with AsyncSessionLocal() as db:
             await save_message(
                 db=db,
@@ -97,8 +100,28 @@ async def send_reply(state: AgentState) -> AgentState:
             )
 
             # 3 — Update thread status
-            new_status = _resolve_thread_status(state)
-            await update_thread_status(db, thread_id, new_status)
+            new_thread_status = _resolve_thread_status(state)
+            await update_thread_status(db, thread_id, new_thread_status)
+
+            # 4 — Update prospect status to reflect conversation progress
+            prospect_id = state.get("prospect_id")
+            if prospect_id:
+                new_prospect_status = _resolve_prospect_status(state)
+                if new_prospect_status:
+                    from sqlalchemy import select
+                    from app.models.prospect import Prospect
+                    result = await db.execute(
+                        select(Prospect).where(Prospect.id == prospect_id)
+                    )
+                    prospect = result.scalar_one_or_none()
+                    if prospect and prospect.status != new_prospect_status:
+                        prospect.status = new_prospect_status
+                        db.add(prospect)
+                        logger.info(
+                            f"[send_reply] Prospect {prospect_id} status "
+                            f"→ '{new_prospect_status}'"
+                        )
+
             await db.commit()
 
         logger.info(
@@ -124,19 +147,48 @@ def _resolve_thread_status(state: AgentState) -> str:
     """
     Determine the new thread status after the reply is sent.
 
-    Logic:
-      - declined intent or walkaway negotiation action → CLOSED
-      - scheduling / rescheduling intents → ACTIVE (ongoing)
-      - everything else → WAITING (awaiting prospect reply)
+    Terminal (CLOSED) — no more automated replies ever:
+      • Meeting confirmed or rescheduled  → meeting is booked, job done
+      • Prospect declined                 → conversation over
+      • Negotiation walkaway              → we ended the negotiation
+
+    Active (WAITING) — waiting for the next prospect reply:
+      • Everything else
     """
     intent = state.get("intent", "")
     negotiation_action = state.get("negotiation_action", "")
     meeting_status = state.get("meeting_status", "")
 
-    if intent == "declined" or negotiation_action == "walkaway":
+    if (
+        meeting_status in ("confirmed", "rescheduled")
+        or intent == "declined"
+        or negotiation_action == "walkaway"
+    ):
         return ThreadStatus.CLOSED.value
 
-    if meeting_status in ("confirmed", "rescheduled"):
-        return ThreadStatus.ACTIVE.value
-
     return ThreadStatus.WAITING.value
+
+
+def _resolve_prospect_status(state: AgentState) -> str | None:
+    """
+    Map the current conversation state to a ProspectStatus value.
+
+    Returns None when no status change is warranted.
+    """
+    intent = state.get("intent", "")
+    negotiation_action = state.get("negotiation_action", "")
+    meeting_status = state.get("meeting_status", "")
+
+    if meeting_status in ("confirmed", "rescheduled"):
+        return ProspectStatus.SCHEDULED.value
+
+    if intent == "declined" or negotiation_action == "walkaway":
+        return ProspectStatus.DECLINED.value
+
+    if intent == "negotiating":
+        return ProspectStatus.NEGOTIATING.value
+
+    if intent in ("interested", "curious", "reschedule", "unavailable"):
+        return ProspectStatus.INTERESTED.value
+
+    return None

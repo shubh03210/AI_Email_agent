@@ -77,6 +77,7 @@ from app.agents.nodes.scheduling import scheduling
 from app.agents.nodes.send_reply import send_reply
 from app.agents.state import AgentState
 from app.core.logging import logger
+from app.models.email_thread import ThreadStatus
 
 
 # ── Routing Functions ─────────────────────────────────────────────────────────
@@ -230,6 +231,23 @@ async def run_agent(thread_id: int) -> AgentState:
             "error": f"Thread {thread_id} not found in database.",
             "error_node": "run_agent",
             "reply_sent": False,
+        }
+
+    # Do not re-run the agent once the thread is fully closed.
+    # The thread reaches CLOSED when:
+    #   • a meeting is confirmed or rescheduled   (scheduling / rescheduling nodes)
+    #   • the prospect declined                   (reply_generation node)
+    # Any new email from the prospect after that point should be treated as a
+    # brand-new conversation and handled manually — not automatically replied to.
+    if memory.thread_status == ThreadStatus.CLOSED.value:
+        logger.info(
+            f"[run_agent] Thread {thread_id} is CLOSED — skipping automated reply."
+        )
+        return {
+            "thread_id": thread_id,
+            "reply_sent": False,
+            "intent": "closed",
+            "error": None,
         }
 
     # Seed the initial state from the memory snapshot

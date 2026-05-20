@@ -56,11 +56,18 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def check_db_connection() -> bool:
-    """Health check — returns True if DB is reachable."""
+    """Health check — returns True if DB is reachable within 5 seconds."""
+    import asyncio
     try:
-        async with engine.connect() as conn:
-            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+        async def _ping():
+            async with engine.connect() as conn:
+                await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+
+        await asyncio.wait_for(_ping(), timeout=5.0)
         return True
+    except asyncio.TimeoutError:
+        logger.warning("DB health check timed out after 5s")
+        return False
     except Exception as exc:
         logger.error(f"DB connection check failed: {exc}")
         return False

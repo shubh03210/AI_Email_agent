@@ -16,7 +16,7 @@ class AgentConfig(Base):
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
     working_hours_start: Mapped[int] = mapped_column(Integer, nullable=False, default=9)
     working_hours_end: Mapped[int] = mapped_column(Integer, nullable=False, default=18)
-    follow_up_days: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    follow_up_days: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     max_follow_ups: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(

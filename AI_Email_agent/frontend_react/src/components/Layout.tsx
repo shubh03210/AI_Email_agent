@@ -66,8 +66,15 @@ export function Layout() {
               {health ? `API ${health.status === 'ok' ? 'online' : 'degraded'}` : 'Connecting…'}
             </span>
           </div>
-          {health?.version && (
-            <p className="text-xs text-slate-600 mt-0.5">v{health.version}</p>
+          {health && (
+            <div className="mt-1 space-y-0.5">
+              <p className="text-xs text-slate-600">
+                DB: <span className={health.db === 'connected' ? 'text-green-500' : 'text-red-500'}>{health.db}</span>
+                {' · '}
+                Redis: <span className={health.redis === 'connected' ? 'text-green-500' : 'text-red-500'}>{health.redis ?? '…'}</span>
+              </p>
+              {health.version && <p className="text-xs text-slate-600">v{health.version}</p>}
+            </div>
           )}
         </div>
       </aside>
