@@ -8,7 +8,7 @@ An AI-powered email agent that automatically handles prospect email threads — 
 |---|---|
 | Backend API | FastAPI |
 | Agent Orchestration | LangGraph |
-| LLM | OpenAI GPT-4o |
+| LLM | Groq |
 | Email | Gmail API |
 | Calendar | Google Calendar API |
 | Database | PostgreSQL + SQLAlchemy (async) |
