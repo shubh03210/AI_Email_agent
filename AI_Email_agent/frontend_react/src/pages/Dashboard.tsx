@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Users, MessageSquare, Calendar, Activity } from 'lucide-react'
+import { Users, MessageSquare, Calendar, Activity, TrendingUp, RefreshCw, AlertTriangle } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell
 } from 'recharts'
-import { prospectsApi, meetingsApi, logsApi } from '../api/client'
-import type { Prospect, AgentRun } from '../api/client'
+import { metricsApi, logsApi } from '../api/client'
+import type { Metrics, AgentRun } from '../api/client'
 import { MetricCard, Card } from '../components/ui/Card'
 import { Badge } from '../components/ui/Badge'
 
@@ -23,67 +23,116 @@ function fmtDt(s?: string) {
   return new Date(s).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })
 }
 
+function pct(rate: number) {
+  return `${(rate * 100).toFixed(1)}%`
+}
+
 export function Dashboard() {
-  const [prospects, setProspects] = useState<Prospect[]>([])
-  const [meetings, setMeetings] = useState<{ total: number }>({ total: 0 })
+  const [metrics, setMetrics] = useState<Metrics | null>(null)
   const [logs, setLogs] = useState<AgentRun[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
-  useEffect(() => {
+  const load = () => {
+    setLoading(true)
+    setError('')
     Promise.all([
-      prospectsApi.list({ page_size: 100 }),
-      meetingsApi.list({ page_size: 1 }),
+      metricsApi.get(),
       logsApi.list({ page_size: 15 }),
-    ]).then(([p, m, l]) => {
-      setProspects(p.items)
-      setMeetings({ total: m.total })
+    ]).then(([m, l]) => {
+      setMetrics(m)
       setLogs(l.items)
-    }).finally(() => setLoading(false))
-  }, [])
+    }).catch(() => setError('Failed to load dashboard data.')).finally(() => setLoading(false))
+  }
 
-  const statusCounts = prospects.reduce<Record<string, number>>((acc, p) => {
-    acc[p.status] = (acc[p.status] || 0) + 1
-    return acc
-  }, {})
+  useEffect(() => { load() }, [])
 
-  const chartData = Object.entries(statusCounts).map(([status, count]) => ({ status, count }))
-
-  const contacted = statusCounts['contacted'] || 0
-  const scheduled = statusCounts['scheduled'] || 0
+  const chartData = metrics
+    ? Object.entries(metrics.pipeline).map(([status, count]) => ({ status, count }))
+    : []
 
   return (
     <div className="p-6 space-y-6">
-      <div>
-        <h1 className="text-xl font-bold text-slate-200">Dashboard</h1>
-        <p className="text-sm text-slate-500 mt-0.5">AI Email Agent overview</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-bold text-slate-200">Dashboard</h1>
+          <p className="text-sm text-slate-500 mt-0.5">AI Email Agent — pipeline overview</p>
+        </div>
+        <button
+          onClick={load}
+          disabled={loading}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400 border border-[#2a2d3e] rounded-lg hover:border-indigo-500/50 hover:text-indigo-400 transition-colors disabled:opacity-40"
+        >
+          <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
       </div>
 
-      {/* Metrics */}
+      {error && (
+        <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 text-sm">
+          <AlertTriangle size={14} />
+          {error}
+        </div>
+      )}
+
+      {/* Row 1 — Volume metrics */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           label="Total Prospects"
-          value={loading ? '…' : prospects.length}
+          value={loading ? '…' : metrics?.total_prospects ?? 0}
           icon={<Users size={18} />}
           color="text-indigo-400"
         />
         <MetricCard
-          label="Contacted"
-          value={loading ? '…' : contacted}
-          sub="awaiting reply"
+          label="Outreach Sent"
+          value={loading ? '…' : metrics?.outreach_sent ?? 0}
+          sub="left pending"
           icon={<MessageSquare size={18} />}
           color="text-blue-400"
         />
         <MetricCard
           label="Meetings Booked"
-          value={loading ? '…' : meetings.total}
+          value={loading ? '…' : metrics?.meetings_booked ?? 0}
           icon={<Calendar size={18} />}
           color="text-cyan-400"
         />
         <MetricCard
-          label="Calls Scheduled"
-          value={loading ? '…' : scheduled}
+          label="Active Negotiations"
+          value={loading ? '…' : metrics?.active_negotiations ?? 0}
           icon={<Activity size={18} />}
+          color="text-orange-400"
+        />
+      </div>
+
+      {/* Row 2 — Rate metrics */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <MetricCard
+          label="Response Rate"
+          value={loading ? '…' : pct(metrics?.response_rate ?? 0)}
+          sub="of outreach sent"
+          icon={<TrendingUp size={18} />}
           color="text-green-400"
+        />
+        <MetricCard
+          label="Booking Conversion"
+          value={loading ? '…' : pct(metrics?.booking_conversion ?? 0)}
+          sub="meetings / outreach"
+          icon={<Calendar size={18} />}
+          color="text-teal-400"
+        />
+        <MetricCard
+          label="Negotiation Success"
+          value={loading ? '…' : pct(metrics?.negotiation_success ?? 0)}
+          sub="accepted of resolved"
+          icon={<TrendingUp size={18} />}
+          color="text-emerald-400"
+        />
+        <MetricCard
+          label="Reschedule Rate"
+          value={loading ? '…' : pct(metrics?.reschedule_pct ?? 0)}
+          sub={`walkaway: ${loading ? '…' : pct(metrics?.walkaway_pct ?? 0)}`}
+          icon={<RefreshCw size={18} />}
+          color="text-yellow-400"
         />
       </div>
 

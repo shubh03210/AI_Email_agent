@@ -24,10 +24,42 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.services.email_parser import clean_email_body
+
+
+# ── Retry helpers ─────────────────────────────────────────────────────────────
+
+def _is_transient_error(exc: Exception) -> bool:
+    """
+    Return True only for errors that are worth retrying.
+
+    Retryable:
+      - 429 Too Many Requests (Gmail rate limit)
+      - 5xx Server errors (Gmail service temporarily unavailable)
+      - Any non-HttpError exception (network timeouts, connection resets, etc.)
+
+    Non-retryable (wasting retries would hide bugs):
+      - 400 Bad Request
+      - 401 Unauthorized  (caller should refresh credentials)
+      - 403 Forbidden
+      - 404 Not Found
+    """
+    if isinstance(exc, HttpError):
+        status = int(exc.resp.status)
+        return status == 429 or status >= 500
+    return True  # all non-HttpError exceptions are potentially transient
+
+
+_RETRY_KWARGS = dict(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception(_is_transient_error),
+    reraise=True,
+)
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -97,29 +129,40 @@ def _build_service():
 
 # ── Message Parsing ───────────────────────────────────────────────────────────
 
-def _decode_body(payload: dict) -> str:
+def _decode_body(payload: dict) -> tuple[str, bool]:
     """
     Recursively extract plain-text body from a Gmail message payload.
-    Prefers text/plain, falls back to text/html with tags stripped.
+
+    Preference order:
+      1. text/plain  (already plain text — return as-is)
+      2. text/html   (convert to plain text via email_parser.html_to_text)
+      3. Multipart   (recurse into parts, depth-first)
+
+    Returns:
+        (body_text, is_html) — is_html=True means the raw content was HTML
+        and html_to_text has already been applied.
     """
     mime_type = payload.get("mimeType", "")
     body_data = payload.get("body", {}).get("data", "")
 
     if mime_type == "text/plain" and body_data:
-        return base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        text = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        return text, False
 
     if mime_type == "text/html" and body_data:
         raw_html = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
-        # Basic tag stripping — replace with BeautifulSoup if needed
-        import re
-        return re.sub(r"<[^>]+>", "", raw_html).strip()
+        return clean_email_body(raw_html, is_html=True), True
 
+    # Prefer text/plain part over text/html in multipart messages
+    plain_body: Optional[str] = None
     for part in payload.get("parts", []):
-        result = _decode_body(part)
-        if result:
-            return result
+        body, is_html = _decode_body(part)
+        if body and not is_html and plain_body is None:
+            plain_body = body
+        elif body and plain_body is None:
+            plain_body = body  # accept HTML-derived text as fallback
 
-    return ""
+    return plain_body or "", False
 
 
 def _extract_header(headers: list[dict], name: str) -> str:
@@ -148,7 +191,10 @@ def parse_message(raw_msg: dict) -> ParsedMessage:
     except Exception:
         timestamp = datetime.now(timezone.utc)
 
-    body = _decode_body(payload)
+    raw_body, was_html = _decode_body(payload)
+    # For plain-text bodies (not already processed by html_to_text), run the
+    # full parsing pipeline: strip forwarded blocks, quoted replies, signatures.
+    body = raw_body if was_html else clean_email_body(raw_body, is_html=False)
 
     return ParsedMessage(
         message_id=raw_msg.get("id", ""),
@@ -165,11 +211,7 @@ def parse_message(raw_msg: dict) -> ParsedMessage:
 
 # ── Core Gmail Operations ─────────────────────────────────────────────────────
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
+@retry(**_RETRY_KWARGS)
 def send_email(
     to: str,
     subject: str,
@@ -216,11 +258,7 @@ def send_email(
         raise
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
+@retry(**_RETRY_KWARGS)
 def reply_to_thread(
     thread_id: str,
     to: str,
@@ -231,16 +269,22 @@ def reply_to_thread(
 ) -> SentMessage:
     """
     Send a reply within an existing Gmail thread.
-    Gmail threads are kept together by the In-Reply-To and References headers,
-    but the simplest reliable approach is to set the threadId on the message.
+
+    Thread continuity is preserved via two mechanisms:
+      1. ``threadId`` in the API request body  — Gmail-side grouping (mandatory).
+      2. ``In-Reply-To`` / ``References`` MIME headers  — RFC 2822 cross-client
+         threading (Outlook, Apple Mail, etc.).  These are populated by fetching
+         the RFC 2822 ``Message-ID`` header of the last message in the thread
+         using a lightweight ``format=metadata`` API call.  If the lookup fails
+         for any reason we fall back to ``threadId``-only behaviour.
 
     Args:
         thread_id: The Gmail threadId to reply into.
         to:        Recipient email address.
-        subject:   Subject line (should match original, prefixed with Re: if desired).
-        body:      Reply body.
-        sender:    Gmail user ID.
-        html:      Send as HTML.
+        subject:   Subject line (prefixed with "Re: " if not already present).
+        body:      Reply body (plain text or HTML).
+        sender:    Gmail user ID ("me" = authenticated account).
+        html:      Send body as text/html instead of text/plain.
 
     Returns:
         SentMessage with the new message_id and thread_id.
@@ -250,9 +294,16 @@ def reply_to_thread(
     mime_type = "html" if html else "plain"
     reply_subject = subject if subject.startswith("Re:") else f"Re: {subject}"
 
+    # Best-effort: look up the RFC 2822 Message-ID of the last message in the
+    # thread so we can set proper In-Reply-To / References headers.
+    in_reply_to: Optional[str] = _get_last_rfc_message_id(service, thread_id)
+
     msg = MIMEMultipart("alternative")
     msg["To"] = to
     msg["Subject"] = reply_subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
     msg.attach(MIMEText(body, mime_type, "utf-8"))
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
@@ -263,7 +314,8 @@ def reply_to_thread(
             body={"raw": raw, "threadId": thread_id},
         ).execute()
         logger.info(
-            f"Reply sent to {to} in thread {thread_id} | message_id={result['id']}"
+            f"Reply sent to {to} in thread {thread_id} | "
+            f"message_id={result['id']} in_reply_to={'set' if in_reply_to else 'none'}"
         )
         return SentMessage(
             message_id=result["id"],
@@ -275,11 +327,39 @@ def reply_to_thread(
         raise
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
+def _get_last_rfc_message_id(service, gmail_thread_id: str) -> Optional[str]:
+    """
+    Fetch the RFC 2822 ``Message-ID`` header of the most recent message in a
+    Gmail thread.
+
+    Uses ``format=metadata`` with ``metadataHeaders=["Message-ID"]`` — this is
+    the lightest API call possible (no body fetch).
+
+    Returns the raw header value (e.g. "<CABdQ5c4Y2g@mail.gmail.com>") or None
+    if the lookup fails for any reason.
+    """
+    try:
+        thread_data = service.users().threads().get(
+            userId="me",
+            id=gmail_thread_id,
+            format="metadata",
+            metadataHeaders=["Message-ID"],
+        ).execute()
+        messages = thread_data.get("messages", [])
+        if messages:
+            headers = messages[-1].get("payload", {}).get("headers", [])
+            for h in headers:
+                if h.get("name", "").lower() == "message-id":
+                    return h.get("value")
+    except Exception as exc:
+        logger.debug(
+            f"[gmail] Could not fetch Message-ID header for thread "
+            f"{gmail_thread_id}: {exc}"
+        )
+    return None
+
+
+@retry(**_RETRY_KWARGS)
 def fetch_unread_messages(
     user_id: str = "me",
     max_results: int = 20,
@@ -339,11 +419,7 @@ def fetch_unread_messages(
         raise
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
+@retry(**_RETRY_KWARGS)
 def fetch_thread_messages(
     thread_id: str,
     user_id: str = "me",

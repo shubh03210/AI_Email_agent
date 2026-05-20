@@ -60,6 +60,7 @@ async def list_prospects(
             or_(
                 Prospect.name.ilike(pattern),
                 Prospect.email.ilike(pattern),
+                Prospect.company.ilike(pattern),
             )
         )
 
@@ -83,6 +84,7 @@ async def create(db: AsyncSession, payload: ProspectCreate) -> Prospect:
     prospect = Prospect(
         name=payload.name,
         email=payload.email,
+        company=payload.company,
         timezone=payload.timezone,
     )
     db.add(prospect)

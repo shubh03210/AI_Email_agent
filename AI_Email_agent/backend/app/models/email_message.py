@@ -34,6 +34,13 @@ class EmailMessage(Base):
     )
     sender: Mapped[str] = mapped_column(String(320), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Dedicated column for the Gmail API message ID (e.g. "17f9e2f3d8c4a1b2").
+    # Nullable because agent-sent outbound messages may be set asynchronously
+    # after the Gmail send completes.  A partial unique index (WHERE NOT NULL)
+    # prevents duplicate ingest of the same Gmail message.
+    gmail_message_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
     raw_payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     intent: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
     timestamp: Mapped[datetime] = mapped_column(
@@ -49,6 +56,15 @@ class EmailMessage(Base):
 
     __table_args__ = (
         Index("ix_email_messages_thread_timestamp", "thread_id", "timestamp"),
+        # Partial unique index: only one row per Gmail message ID when non-NULL.
+        # This prevents duplicate ingest even if the application-level check
+        # is bypassed (e.g. race between two Celery workers).
+        Index(
+            "uix_email_messages_gmail_id",
+            "gmail_message_id",
+            unique=True,
+            postgresql_where=("gmail_message_id IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:

@@ -1,5 +1,5 @@
 import enum
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from sqlalchemy import Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -26,6 +26,7 @@ class Prospect(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
+    company: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
     status: Mapped[str] = mapped_column(
         String(32),
@@ -34,10 +35,13 @@ class Prospect(Base, TimestampMixin):
         index=True,
     )
 
+    # passive_deletes=True: rely on DB-level ON DELETE CASCADE rather than
+    # loading all child EmailThread rows into memory before deletion.
     threads: Mapped[List["EmailThread"]] = relationship(
         "EmailThread",
         back_populates="prospect",
         cascade="all, delete-orphan",
+        passive_deletes=True,
         lazy="selectin",
     )
 

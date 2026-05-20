@@ -12,6 +12,7 @@ Design:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Type, TypeVar
@@ -27,6 +28,11 @@ from app.core.logging import logger
 
 T = TypeVar("T", bound=BaseModel)
 
+
+# ── Tone Presets (re-exported from tone_service for convenience) ──────────────
+# The actual definitions live in app.services.tone_service so any module can
+# import them without pulling in the full LangChain stack.
+from app.services.tone_service import TONE_PRESETS, get_tone_description  # noqa: F401
 
 # ── Structured Output Schemas ─────────────────────────────────────────────────
 
@@ -148,6 +154,28 @@ class BaseLLMProvider(ABC):
             An instance of output_schema populated with the model's response.
         """
         ...
+
+    # ── Async wrappers ────────────────────────────────────────────────────────
+    # LLM providers use synchronous HTTP clients (langchain-groq wraps the
+    # groq SDK which is sync).  These async wrappers move the blocking call
+    # to a thread-pool worker via asyncio.to_thread() so the event loop is
+    # not blocked while waiting for the LLM response.  All LangGraph nodes
+    # should call these instead of the sync variants.
+
+    async def async_generate(self, system_prompt: str, user_message: str) -> str:
+        """Non-blocking wrapper around generate()."""
+        return await asyncio.to_thread(self.generate, system_prompt, user_message)
+
+    async def async_generate_structured(
+        self,
+        system_prompt: str,
+        user_message: str,
+        output_schema: Type[T],
+    ) -> T:
+        """Non-blocking wrapper around generate_structured()."""
+        return await asyncio.to_thread(
+            self.generate_structured, system_prompt, user_message, output_schema
+        )
 
 
 # ── Groq Implementation ───────────────────────────────────────────────────────
@@ -300,15 +328,17 @@ def decide_negotiation(
 def generate_reply(
     conversation_history: str,
     instruction: str,
-    tone: str = "professional",
+    tone: str = "formal",
     agent_name: str = "Alex",
+    agent_title: str = "HR Recruiter",
 ) -> EmailReply:
     """Generate a final polished email reply."""
+    tone_desc = get_tone_description(tone)
     llm = get_llm_service()
     return llm.generate_structured(
         system_prompt=(
-            f"You are {agent_name}, a professional recruiter writing on behalf of your company. "
-            f"Write emails in a {tone} tone. "
+            f"You are {agent_name}, {agent_title} writing on behalf of your company. "
+            f"Write emails in a {tone_desc} style. "
             "Keep replies concise, clear, and human — never robotic. "
             "Do NOT use generic filler phrases like 'I hope this email finds you well'. "
             "Always end with a clear call to action."
@@ -324,15 +354,17 @@ def generate_reply(
 def generate_outreach_email(
     prospect_name: str,
     gig_description: str,
-    tone: str = "professional",
+    tone: str = "formal",
     agent_name: str = "Alex",
+    agent_title: str = "HR Recruiter",
 ) -> EmailDraft:
     """Generate the first cold outreach email for a prospect."""
+    tone_desc = get_tone_description(tone)
     llm = get_llm_service()
     return llm.generate_structured(
         system_prompt=(
-            f"You are {agent_name}, a professional recruiter reaching out to potential candidates. "
-            f"Write a compelling cold outreach email in a {tone} tone. "
+            f"You are {agent_name}, {agent_title} reaching out to potential candidates. "
+            f"Write a compelling cold outreach email in a {tone_desc} style. "
             "The email must be:\n"
             "- Short (under 150 words)\n"
             "- Personalised to the recipient's name\n"
@@ -355,18 +387,21 @@ def generate_followup_email(
     days_since: int,
     follow_up_number: int,
     max_follow_ups: int,
-    tone: str = "professional",
+    tone: str = "formal",
     agent_name: str = "Alex",
+    agent_title: str = "HR Recruiter",
 ) -> EmailDraft:
     """Generate a follow-up email for a prospect who has not replied."""
     from app.agents.prompts import FOLLOWUP_SYSTEM, FOLLOWUP_USER
 
+    tone_desc = get_tone_description(tone)
     llm = get_llm_service()
     return llm.generate_structured(
         system_prompt=FOLLOWUP_SYSTEM.format(
             agent_name=agent_name,
+            agent_title=agent_title,
             follow_up_number=follow_up_number,
-            tone=tone,
+            tone=tone_desc,
         ),
         user_message=FOLLOWUP_USER.format(
             prospect_name=prospect_name,

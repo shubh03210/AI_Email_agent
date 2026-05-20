@@ -1,22 +1,37 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import {
-  LayoutDashboard, Users, MessageSquare, Calendar,
-  ScrollText, Settings, Bot, Circle
+  Bot,
+  Calendar,
+  Circle,
+  LayoutDashboard,
+  LogOut,
+  MessageSquare,
+  ScrollText,
+  Settings,
+  Users,
 } from 'lucide-react'
 import { clsx } from 'clsx'
+import { useAuth } from '../contexts/AuthContext'
 import { useHealth } from '../hooks/useHealth'
 
 const nav = [
-  { to: '/',         label: 'Dashboard',  icon: LayoutDashboard },
+  { to: '/',          label: 'Dashboard', icon: LayoutDashboard },
   { to: '/prospects', label: 'Prospects', icon: Users },
-  { to: '/threads',  label: 'Threads',    icon: MessageSquare },
-  { to: '/meetings', label: 'Meetings',   icon: Calendar },
-  { to: '/logs',     label: 'Logs',       icon: ScrollText },
-  { to: '/config',   label: 'Config',     icon: Settings },
+  { to: '/threads',   label: 'Threads',   icon: MessageSquare },
+  { to: '/meetings',  label: 'Meetings',  icon: Calendar },
+  { to: '/logs',      label: 'Logs',      icon: ScrollText },
+  { to: '/config',    label: 'Config',    icon: Settings },
 ]
 
 export function Layout() {
   const health = useHealth()
+  const { logout } = useAuth()
+  const navigate = useNavigate()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login', { replace: true })
+  }
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#0f1117]">
@@ -46,7 +61,7 @@ export function Layout() {
                 'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors',
                 isActive
                   ? 'bg-indigo-600/20 text-indigo-400 font-medium'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-[#20243a]'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-[#20243a]',
               )}
             >
               <Icon size={16} />
@@ -55,8 +70,8 @@ export function Layout() {
           ))}
         </nav>
 
-        {/* API Status */}
-        <div className="px-4 py-3 border-t border-[#2a2d3e]">
+        {/* Footer: API status + logout */}
+        <div className="px-4 py-3 border-t border-[#2a2d3e] space-y-2">
           <div className="flex items-center gap-2">
             <Circle
               size={8}
@@ -67,15 +82,29 @@ export function Layout() {
             </span>
           </div>
           {health && (
-            <div className="mt-1 space-y-0.5">
+            <div className="space-y-0.5">
               <p className="text-xs text-slate-600">
-                DB: <span className={health.db === 'connected' ? 'text-green-500' : 'text-red-500'}>{health.db}</span>
+                DB:{' '}
+                <span className={health.db === 'connected' ? 'text-green-500' : 'text-red-500'}>
+                  {health.db}
+                </span>
                 {' · '}
-                Redis: <span className={health.redis === 'connected' ? 'text-green-500' : 'text-red-500'}>{health.redis ?? '…'}</span>
+                Redis:{' '}
+                <span className={health.redis === 'connected' ? 'text-green-500' : 'text-red-500'}>
+                  {health.redis ?? '…'}
+                </span>
               </p>
               {health.version && <p className="text-xs text-slate-600">v{health.version}</p>}
             </div>
           )}
+
+          <button
+            onClick={handleLogout}
+            className="flex items-center gap-2 w-full px-3 py-1.5 rounded-lg text-xs text-slate-500 hover:text-slate-300 hover:bg-[#20243a] transition-colors"
+          >
+            <LogOut size={13} />
+            Sign out
+          </button>
         </div>
       </aside>
 

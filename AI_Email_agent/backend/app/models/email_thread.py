@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -48,14 +48,43 @@ class EmailThread(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True, default=None
     )
 
+    # ── Agent hardening (Phase 5) ─────────────────────────────────────────
+    # thread_summary: LLM-generated rolling summary of messages that fall
+    #   outside the memory window.  Prepended to the windowed context so the
+    #   LLM always sees a compact history, even for long-running threads.
+    thread_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ambiguous_count: consecutive runs where classify_intent returned
+    #   "ambiguous" (reset to 0 when any non-ambiguous intent is detected).
+    #   Drives the repeated-ambiguity escalation threshold.
+    ambiguous_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # agent_escalated: True when the agent cannot handle this thread
+    #   autonomously (confidence too low, repeated ambiguity, API failures).
+    #   When True, the agent produces a human-handoff reply and stops
+    #   making routing decisions.
+    agent_escalated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, index=True
+    )
+
+    # escalation_reason: human-readable reason for the escalation decision,
+    #   stored for operator review.
+    escalation_reason: Mapped[Optional[str]] = mapped_column(
+        String(512), nullable=True
+    )
+
     prospect: Mapped["Prospect"] = relationship(
         "Prospect",
         back_populates="threads",
     )
+    # passive_deletes=True on all child relationships: DB ON DELETE CASCADE
+    # handles the actual deletions, so SQLAlchemy does not load child rows
+    # into memory when a thread (or its parent prospect) is deleted.
     messages: Mapped[List["EmailMessage"]] = relationship(
         "EmailMessage",
         back_populates="thread",
         cascade="all, delete-orphan",
+        passive_deletes=True,
         order_by="EmailMessage.timestamp",
         lazy="selectin",
     )
@@ -63,6 +92,7 @@ class EmailThread(Base, TimestampMixin):
         "Negotiation",
         back_populates="thread",
         cascade="all, delete-orphan",
+        passive_deletes=True,
         uselist=False,
         lazy="selectin",
     )
@@ -70,6 +100,7 @@ class EmailThread(Base, TimestampMixin):
         "Meeting",
         back_populates="thread",
         cascade="all, delete-orphan",
+        passive_deletes=True,
         uselist=False,
         lazy="selectin",
     )
@@ -77,6 +108,7 @@ class EmailThread(Base, TimestampMixin):
         "AgentRun",
         back_populates="thread",
         cascade="all, delete-orphan",
+        passive_deletes=True,
         order_by="AgentRun.created_at",
         lazy="selectin",
     )

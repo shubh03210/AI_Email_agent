@@ -11,7 +11,7 @@ function fmtDt(s?: string) {
   return new Date(s).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
-const STATUS_OPTIONS = ['', 'confirmed', 'cancelled', 'rescheduled']
+const STATUS_OPTIONS = ['', 'proposed', 'confirmed', 'rescheduled', 'cancelled', 'completed']
 
 export function Meetings() {
   const [data, setData] = useState<{ items: Meeting[]; total: number }>({ items: [], total: 0 })

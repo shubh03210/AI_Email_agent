@@ -11,12 +11,14 @@ from pydantic import BaseModel, EmailStr, ConfigDict, Field
 class ProspectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
+    company: Optional[str] = Field(None, max_length=255)
     timezone: str = Field(default="UTC", max_length=64)
 
 
 class ProspectUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     email: Optional[EmailStr] = None
+    company: Optional[str] = Field(None, max_length=255)
     timezone: Optional[str] = Field(None, max_length=64)
     status: Optional[str] = Field(None, max_length=32)
 
@@ -29,6 +31,7 @@ class ProspectRead(BaseModel):
     id: int
     name: str
     email: str
+    company: Optional[str]
     timezone: str
     status: str
     created_at: datetime

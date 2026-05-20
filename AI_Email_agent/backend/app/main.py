@@ -3,10 +3,49 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.v1.api import api_router
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
+from app.core.rate_limit import limiter
+
+
+async def _bootstrap_admin() -> None:
+    """
+    Create the default admin user on first startup if the users table is empty.
+    Uses ADMIN_USERNAME / ADMIN_PASSWORD from settings (set via .env).
+    This runs inside the lifespan so it shares the application's async context.
+    """
+    from app.db.session import AsyncSessionLocal
+    from app.repositories import user_repo
+    from app.schemas.user import UserCreate
+
+    async with AsyncSessionLocal() as session:
+        try:
+            count = await user_repo.count_all(session)
+            if count == 0:
+                await user_repo.create(
+                    session,
+                    UserCreate(
+                        username=settings.ADMIN_USERNAME,
+                        password=settings.ADMIN_PASSWORD,
+                        role="admin",
+                    ),
+                )
+                await session.commit()
+                logger.info(
+                    f"Default admin user bootstrapped | username={settings.ADMIN_USERNAME!r}"
+                )
+            else:
+                logger.debug(f"Users table has {count} record(s) — bootstrap skipped")
+        except Exception as exc:
+            await session.rollback()
+            # Non-fatal: if the table doesn't exist yet (before migrations) or DB is
+            # temporarily unavailable, log and continue — the app is still usable.
+            logger.warning(f"Admin bootstrap skipped (will retry on next start): {exc}")
 
 
 @asynccontextmanager
@@ -16,9 +55,19 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {'debug' if settings.DEBUG else 'production'}")
     logger.info(f"Docs: http://localhost:8000{settings.API_V1_STR}/docs")
 
-    # Register ALL SQLAlchemy models so relationship strings resolve at startup,
-    # not lazily on first request (which causes mapper initialization errors).
+    # ── Deployment readiness checks ───────────────────────────────────────────
+    # Validate environment variables and credential files at startup.
+    # Errors are logged but do NOT abort startup (degraded > crash-loop).
+    from app.core.env_check import check_environment, log_env_report
+    env_report = check_environment()
+    log_env_report(env_report, abort_on_errors=False)
+
+    # Populate SQLAlchemy metadata so relationship strings resolve before the
+    # first request (prevents mapper initialisation errors).
     import app.db.init_db  # noqa: F401
+
+    # Seed the initial admin account if no users exist yet
+    await _bootstrap_admin()
 
     yield
     logger.info(f"Shutting down {settings.PROJECT_NAME}")
@@ -44,25 +93,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SlowAPIMiddleware)
+
+# ── Rate limiting setup ───────────────────────────────────────────────────────
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ── Convenience routes ────────────────────────────────────────────────────────
 
 @app.get("/", include_in_schema=False)
 async def root_redirect():
-    """Redirect root to the interactive API docs."""
     return RedirectResponse(url=f"{settings.API_V1_STR}/docs")
 
 
 @app.get("/docs", include_in_schema=False)
 async def docs_redirect():
-    """Short /docs alias → versioned docs."""
     return RedirectResponse(url=f"{settings.API_V1_STR}/docs")
 
 
-@app.get("/health", tags=["health"], summary="API health check")
+@app.get("/health", tags=["health"], summary="API liveness probe")
 async def health():
-    """Quick liveness probe — returns 200 if the API process is running."""
     return {"status": "ok", "version": settings.VERSION}
 
 

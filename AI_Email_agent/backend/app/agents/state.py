@@ -68,6 +68,36 @@ class AgentState(TypedDict, total=False):
     # ── Run Logging ───────────────────────────────────────────────────────────
     agent_run_id: Optional[int]             # DB ID of the current AgentRun row
 
+    # ── Calendar Escalation (Phase 4) ─────────────────────────────────────────
+    # Populated from Meeting.needs_human_review when thread memory is loaded.
+    # When True, scheduling/rescheduling nodes skip automation and return a
+    # human-escalation reply instruction instead.
+    needs_human_review: Optional[bool]
+    calendar_failure_count: Optional[int]
+
+    # ── Agent Escalation (Phase 5) ────────────────────────────────────────────
+    # Separate from the calendar-specific flags above.  Set True when the
+    # agent cannot determine intent reliably (repeated ambiguity, low
+    # confidence, API failures).  classify_intent checks this at entry and
+    # route_after_intent short-circuits to reply_generation when True.
+    agent_escalated: Optional[bool]
+    escalation_reason: Optional[str]
+    ambiguous_count: Optional[int]
+
+    # ── Rolling Memory (Phase 5) ──────────────────────────────────────────────
+    # LLM-generated compressed summary of messages outside the memory window.
+    # Prepended to the recent-message window to give the LLM full context
+    # without unbounded token growth.
+    thread_summary: Optional[str]
+
+    # ── Config-driven behaviour (Phase 8) ────────────────────────────────────
+    # Seeded from the active AgentConfig in run_agent().
+    tone: Optional[str]                         # e.g. "formal", "startup"
+    recruiter_name: Optional[str]               # e.g. "Alex"
+    recruiter_title: Optional[str]              # e.g. "HR Recruiter"
+    recruiter_signature: Optional[str]          # appended to reply_body by send_reply
+    meeting_confirmation_template: Optional[str]  # used by scheduling node
+
     # ── Error Handling ────────────────────────────────────────────────────────
     error: Optional[str]
     error_node: Optional[str]               # which node raised the error

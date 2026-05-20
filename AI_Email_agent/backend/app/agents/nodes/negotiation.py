@@ -48,8 +48,16 @@ async def negotiation(state: AgentState) -> AgentState:
     """
     thread_id = state.get("thread_id")
     conversation_text = state.get("conversation_text", "")
-    max_budget: float = state.get("max_budget") or 5000.0
+    # Prefer agent_config.budget_ceiling; fall back to the loaded negotiation
+    # max_budget; final fallback to the settings default.
+    max_budget: float = (
+        state.get("budget_ceiling")
+        or state.get("max_budget")
+        or 5000.0
+    )
     current_offer = state.get("current_offer")
+    # counter_round is loaded from DB (graph.py seeds it from memory.counter_round),
+    # so walkaway-after-N-rounds accumulates correctly across emails.
     counter_round: int = state.get("counter_round") or 0
     previous_prospect_offer = state.get("previous_prospect_offer")
 
@@ -78,8 +86,16 @@ async def negotiation(state: AgentState) -> AgentState:
                 previous_prospect_offer=previous_prospect_offer,
             )
 
-            # Persist
+            # Persist: update counter_offer + status + round counter + prospect offer
             neg = await neg_svc.record_counter_offer(db, neg, result)
+            # Persist the new round count so it accumulates across agent runs
+            neg.counter_round = counter_round + 1
+            # Store the prospect's latest offer for Rule 3 (not moving → walkaway)
+            extracted_offer = _extract_prospect_offer(state, max_budget)
+            if extracted_offer != max_budget * 1.2:
+                # Only persist when we have a real offer, not the fallback sentinel
+                neg.last_prospect_offer = extracted_offer
+            db.add(neg)
             await db.commit()
 
         logger.info(

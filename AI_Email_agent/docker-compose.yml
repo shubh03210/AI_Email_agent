@@ -1,12 +1,41 @@
-version: "3.9"
+# ══════════════════════════════════════════════════════════════════════════════
+# AI Email Agent — Docker Compose
+#
+# Usage:
+#   cp backend/.env.example backend/.env   # fill in secrets first
+#   docker compose up --build -d
+#
+# Services:
+#   redis          — task broker + result backend
+#   backend        — FastAPI + Alembic migrations (auto-runs on start)
+#   celery_worker  — background task processor (3 queues)
+#   celery_beat    — periodic task scheduler
+#   frontend       — React SPA served by nginx with /api proxy
+#
+# Volumes:
+#   redis_data          — Redis RDB persistence
+#   backend_logs        — shared log directory (backend + workers)
+#   celery_beat_data    — Celery beat schedule state
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── YAML anchors — shared config blocks ──────────────────────────────────────
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  env_file:
+    - ./backend/.env
+  volumes:
+    - ./backend/credentials:/app/credentials:ro
+    - backend_logs:/app/logs
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
 
-  # ── PostgreSQL ───────────────────────────────────────────────────────────────
-  # Using Supabase hosted PostgreSQL — no local postgres container needed.
-  # DATABASE_URL in .env points to Supabase directly.
-
-  # ── Redis ────────────────────────────────────────────────────────────────────
+  # ── Redis ─────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: email_agent_redis
@@ -15,6 +44,8 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    # Persist to disk every 60 s if at least 1 key changed
+    command: redis-server --save 60 1 --loglevel warning
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -22,88 +53,80 @@ services:
       retries: 5
       start_period: 5s
 
-  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
+  # entrypoint.sh runs `alembic upgrade head` before uvicorn starts, so
+  # migrations are always applied on container boot.
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    <<: *backend-base
     container_name: email_agent_backend
-    restart: unless-stopped
     ports:
       - "8000:8000"
-    env_file:
-      - ./backend/.env
-    volumes:
-      - ./backend/credentials:/app/credentials:ro
-      - backend_logs:/app/logs
-    depends_on:
-      redis:
-        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      # Uses /live for a lightweight liveness probe (no DB/Redis call)
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
 
-  # ── Celery Worker ────────────────────────────────────────────────────────────
+  # ── Celery Worker ──────────────────────────────────────────────────────────
   celery_worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    <<: *backend-base
     container_name: email_agent_celery_worker
-    restart: unless-stopped
     command: >
       celery -A app.workers.celery_app worker
       --loglevel=info
       --concurrency=4
       --queues=default,agent,gmail
-    env_file:
-      - ./backend/.env
-    volumes:
-      - ./backend/credentials:/app/credentials:ro
-      - backend_logs:/app/logs
-    depends_on:
-      redis:
-        condition: service_healthy
+      --max-tasks-per-child=200
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping",
+             "--destination", "celery@%h", "--timeout", "5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  # ── Celery Beat (Scheduler) ──────────────────────────────────────────────────
+  # ── Celery Beat (Scheduler) ────────────────────────────────────────────────
   celery_beat:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    <<: *backend-base
     container_name: email_agent_celery_beat
-    restart: unless-stopped
     command: >
       celery -A app.workers.celery_app beat
       --loglevel=info
       --scheduler celery.beat:PersistentScheduler
-    env_file:
-      - ./backend/.env
+      --schedule /app/celerybeat-schedule/schedule.db
     volumes:
-      - celery_beat_data:/app/celerybeat-schedule
+      - ./backend/credentials:/app/credentials:ro
       - backend_logs:/app/logs
-    depends_on:
-      redis:
-        condition: service_healthy
+      - celery_beat_data:/app/celerybeat-schedule
 
-  # ── Streamlit Frontend ───────────────────────────────────────────────────────
+  # ── React Frontend ────────────────────────────────────────────────────────
+  # nginx serves the pre-built SPA and proxies /api/* to the backend container.
+  # The frontend can start once the backend is healthy so the API is reachable.
   frontend:
     build:
-      context: ./frontend
+      context: ./frontend_react
       dockerfile: Dockerfile
     container_name: email_agent_frontend
     restart: unless-stopped
     ports:
-      - "8501:8501"
-    environment:
-      - API_BASE_URL=http://backend:8000/api/v1
+      - "3000:3000"
     depends_on:
       backend:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
-# ── Volumes ──────────────────────────────────────────────────────────────────
+# ── Named volumes ─────────────────────────────────────────────────────────────
 volumes:
   redis_data:
+    driver: local
   backend_logs:
+    driver: local
   celery_beat_data:
+    driver: local

@@ -2,6 +2,12 @@
 Agent Config API
 ─────────────────
 Endpoints for reading and updating the active agent configuration.
+
+Role matrix
+───────────
+  GET  /   admin, operator  (read)
+  PUT  /   admin only       (update)
+  POST /   admin only       (create / replace)
 """
 
 from __future__ import annotations
@@ -9,7 +15,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import get_db
+from app.api.v1.deps import get_db, require_admin
 from app.core.logging import logger
 from app.repositories import config_repo
 from app.schemas.config import AgentConfigCreate, AgentConfigRead, AgentConfigUpdate
@@ -34,7 +40,8 @@ async def get_config(db: AsyncSession = Depends(get_db)) -> AgentConfigRead:
 @router.put(
     "/",
     response_model=AgentConfigRead,
-    summary="Update the active agent configuration",
+    summary="Update the active agent configuration  [admin]",
+    dependencies=[Depends(require_admin)],
 )
 async def update_config(
     payload: AgentConfigUpdate,
@@ -55,7 +62,8 @@ async def update_config(
     "/",
     response_model=AgentConfigRead,
     status_code=status.HTTP_201_CREATED,
-    summary="Create a new agent configuration",
+    summary="Create a new agent configuration  [admin]",
+    dependencies=[Depends(require_admin)],
 )
 async def create_config(
     payload: AgentConfigCreate,

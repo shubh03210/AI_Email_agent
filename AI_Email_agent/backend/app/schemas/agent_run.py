@@ -14,6 +14,7 @@ class AgentRunRead(BaseModel):
     node_name: str
     status: str
     latency_ms: Optional[int]
+    error_message: Optional[str] = None
     input_payload: Optional[Any]
     output_payload: Optional[Any]
     created_at: datetime

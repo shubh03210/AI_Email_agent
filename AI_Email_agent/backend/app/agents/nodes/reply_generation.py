@@ -46,18 +46,27 @@ async def reply_generation(state: AgentState) -> AgentState:
     conversation_text = state.get("conversation_text", "")
     reply_instruction = state.get("reply_instruction") or _default_instruction(state)
     intent = state.get("intent", "unknown")
-    tone = settings.AGENT_DEFAULT_TONE
+
+    # Prefer config-driven values seeded by run_agent(); fall back to settings.
+    from app.services.tone_service import get_tone_description
+    tone = state.get("tone") or settings.AGENT_DEFAULT_TONE
+    tone_desc = get_tone_description(tone)
+    recruiter_name  = state.get("recruiter_name")  or "Alex"
+    recruiter_title = state.get("recruiter_title") or "HR Recruiter"
 
     logger.info(
-        f"[reply_generation] thread={thread_id} intent={intent} tone={tone}"
+        f"[reply_generation] thread={thread_id} intent={intent} "
+        f"tone={tone} recruiter={recruiter_name}"
     )
 
     try:
         llm = get_llm_service()
-        result: EmailReply = llm.generate_structured(
+        result: EmailReply = await llm.async_generate_structured(
             system_prompt=REPLY_GENERATION_SYSTEM.format(
                 persona=AGENT_PERSONA,
-                tone=tone,
+                tone=tone_desc,
+                recruiter_name=recruiter_name,
+                recruiter_title=recruiter_title,
             ),
             user_message=REPLY_GENERATION_USER.format(
                 conversation_text=conversation_text,

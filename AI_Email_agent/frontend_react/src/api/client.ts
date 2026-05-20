@@ -1,10 +1,33 @@
 import axios from 'axios'
+import { TOKEN_KEY } from '../contexts/AuthContext'
 
 const api = axios.create({
   baseURL: '/api/v1',
   headers: { 'Content-Type': 'application/json' },
   timeout: 60000,
 })
+
+// Inject Bearer token on every request (skipped automatically when token absent)
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem(TOKEN_KEY)
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// On 401, clear the stale token and redirect to login
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem(TOKEN_KEY)
+      // Use replace so the back-button doesn't loop back to the 401 page
+      window.location.replace('/login')
+    }
+    return Promise.reject(error)
+  },
+)
 
 export default api
 
@@ -92,8 +115,30 @@ export interface AgentConfig {
   follow_up_days: number
   max_follow_ups: number
   is_active: boolean
+  // Phase 8 fields
+  follow_up_cadence: string        // JSON array string, e.g. "[1, 3, 7]"
+  recruiter_name: string
+  recruiter_title: string
+  recruiter_signature: string
+  meeting_confirmation_template: string
   created_at: string
   updated_at: string
+}
+
+export interface Metrics {
+  total_prospects: number
+  outreach_sent: number
+  responses_received: number
+  response_rate: number             // 0–1
+  meetings_booked: number
+  booking_conversion: number        // 0–1
+  active_negotiations: number
+  negotiations_resolved: number
+  negotiation_success: number       // 0–1
+  reschedule_pct: number            // 0–1
+  walkaway_pct: number              // 0–1
+  pipeline: Record<string, number>
+  meetings_by_status: Record<string, number>
 }
 
 export interface Paginated<T> {
@@ -178,6 +223,13 @@ export const configApi = {
 
   update: (data: Partial<AgentConfig>) =>
     api.put<AgentConfig>('/config/', data).then(r => r.data),
+}
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+export const metricsApi = {
+  get: () =>
+    api.get<Metrics>('/metrics/').then(r => r.data),
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────

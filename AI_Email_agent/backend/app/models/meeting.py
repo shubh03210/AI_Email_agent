@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -45,6 +45,19 @@ class Meeting(Base):
         Integer, nullable=False, default=0
     )
 
+    # ── Human escalation ──────────────────────────────────────────────────────
+    # calendar_failure_count: incremented every time a calendar API operation
+    # fails for this meeting (create, reschedule, or cancel).
+    # needs_human_review: set True when calendar_failure_count reaches the
+    # configured threshold (CALENDAR_MAX_FAILURES).  When True the agent nodes
+    # skip automation and produce a human-escalation reply.
+    calendar_failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    needs_human_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, index=True
+    )
+
     thread: Mapped["EmailThread"] = relationship(
         "EmailThread",
         back_populates="meeting",
@@ -53,5 +66,6 @@ class Meeting(Base):
     def __repr__(self) -> str:
         return (
             f"<Meeting id={self.id} scheduled_at={self.scheduled_at} "
-            f"status={self.status} reschedules={self.reschedule_count}>"
+            f"status={self.status} reschedules={self.reschedule_count} "
+            f"needs_review={self.needs_human_review}>"
         )

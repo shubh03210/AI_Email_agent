@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -31,6 +31,10 @@ class Negotiation(Base):
     )
     max_budget: Mapped[float] = mapped_column(Float, nullable=False)
     current_offer: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Round counter — persisted so walkaway logic accumulates across agent runs
+    counter_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Last dollar amount the prospect offered — used for Rule 3 (not moving → walkaway)
+    last_prospect_offer: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

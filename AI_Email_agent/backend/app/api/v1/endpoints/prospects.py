@@ -2,6 +2,15 @@
 Prospects API
 ──────────────
 CRUD endpoints for managing outreach prospects.
+
+Role matrix
+───────────
+  GET  /               admin, operator  (list)
+  POST /               admin only       (create)
+  GET  /{id}           admin, operator  (read)
+  PUT  /{id}           admin only       (update)
+  DELETE /{id}         admin only       (delete)
+  POST /{id}/outreach  admin, operator  (agent operation)
 """
 
 from __future__ import annotations
@@ -11,7 +20,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import get_db
+from app.api.v1.deps import get_db, require_admin, require_operator_or_admin
 from app.core.logging import logger
 from app.repositories import prospect_repo
 from app.schemas.prospect import (
@@ -51,7 +60,8 @@ async def list_prospects(
     "/",
     response_model=ProspectRead,
     status_code=status.HTTP_201_CREATED,
-    summary="Create a prospect",
+    summary="Create a prospect  [admin]",
+    dependencies=[Depends(require_admin)],
 )
 async def create_prospect(
     payload: ProspectCreate,
@@ -89,7 +99,8 @@ async def get_prospect(
 @router.put(
     "/{prospect_id}",
     response_model=ProspectRead,
-    summary="Update a prospect",
+    summary="Update a prospect  [admin]",
+    dependencies=[Depends(require_admin)],
 )
 async def update_prospect(
     prospect_id: int,
@@ -102,7 +113,6 @@ async def update_prospect(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Prospect {prospect_id} not found.",
         )
-    # If email is being changed, check uniqueness
     if payload.email and payload.email != prospect.email:
         existing = await prospect_repo.get_by_email(db, payload.email)
         if existing:
@@ -118,7 +128,8 @@ async def update_prospect(
 @router.delete(
     "/{prospect_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete a prospect",
+    summary="Delete a prospect  [admin]",
+    dependencies=[Depends(require_admin)],
 )
 async def delete_prospect(
     prospect_id: int,
@@ -138,15 +149,16 @@ async def delete_prospect(
 @router.post(
     "/{prospect_id}/outreach",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Trigger cold outreach for a prospect",
+    summary="Trigger cold outreach for a prospect  [admin, operator]",
 )
 async def trigger_outreach(
     prospect_id: int,
     db: AsyncSession = Depends(get_db),
+    _: object = Depends(require_operator_or_admin),
 ) -> dict:
     """
-    Enqueue a Celery task to generate and send the first outreach email
-    to this prospect. Returns a task ID for polling.
+    Enqueue a Celery task to generate and send the first outreach email.
+    Returns a task ID for polling via /agent/poll/{task_id}.
     """
     prospect = await prospect_repo.get_by_id(db, prospect_id)
     if not prospect:
@@ -154,7 +166,6 @@ async def trigger_outreach(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Prospect {prospect_id} not found.",
         )
-    # Try Celery first; fall back to direct async execution when Redis is unavailable
     try:
         from app.workers.tasks import send_outreach_task
         task = send_outreach_task.delay(prospect_id=prospect_id)
@@ -178,8 +189,8 @@ async def trigger_outreach(
                 "message": f"Outreach sent directly (no Celery). Subject: {result.get('subject', '')}",
             }
         except Exception as inline_exc:
-            logger.exception("Inline outreach also failed")
+            logger.exception(f"Inline outreach also failed: {inline_exc}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Outreach failed: {inline_exc}",
+                detail="An internal error occurred. Please try again.",
             )

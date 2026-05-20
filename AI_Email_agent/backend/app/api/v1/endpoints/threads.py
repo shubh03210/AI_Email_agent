@@ -11,7 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import get_db
+from app.api.v1.deps import get_db, require_operator_or_admin
 from app.core.logging import logger
 from app.repositories import thread_repo, agent_run_repo
 from app.schemas.thread import (
@@ -105,6 +105,7 @@ async def list_messages(
 async def run_agent_for_thread(
     thread_id: int,
     db: AsyncSession = Depends(get_db),
+    _: object = Depends(require_operator_or_admin),
 ) -> dict:
     """
     Enqueue a Celery task to run the AI agent on this thread.
@@ -147,10 +148,10 @@ async def run_agent_for_thread(
                 ),
             }
         except Exception as inline_exc:
-            logger.exception("Inline agent run failed")
+            logger.exception(f"Inline agent run failed: {inline_exc}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Agent run failed: {inline_exc}",
+                detail="An internal error occurred. Please try again.",
             )
 
 

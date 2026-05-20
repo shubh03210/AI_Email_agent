@@ -38,6 +38,8 @@ class ThreadRead(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    follow_up_count: int = 0
+    last_outreach_at: Optional[datetime] = None
 
 
 class ThreadDetail(ThreadRead):

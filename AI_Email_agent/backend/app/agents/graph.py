@@ -75,6 +75,7 @@ from app.agents.nodes.reply_generation import reply_generation
 from app.agents.nodes.rescheduling import rescheduling
 from app.agents.nodes.scheduling import scheduling
 from app.agents.nodes.send_reply import send_reply
+from app.agents.observability import with_observability
 from app.agents.state import AgentState
 from app.core.logging import logger
 from app.models.email_thread import ThreadStatus
@@ -86,17 +87,33 @@ def route_after_intent(state: AgentState) -> str:
     """
     Route from classify_intent to the appropriate decision node.
 
-    Returns a node name (or END on hard errors).
+    Phase 5 additions:
+      - agent_escalated guard: if the thread is flagged for human review,
+        skip all decision nodes and route directly to reply_generation,
+        which uses the escalation reply_instruction already set by
+        classify_intent.
+      - Error guard: unchanged — classify_intent errors still route to
+        reply_generation with a fallback instruction.
     """
+    thread_id = state.get("thread_id")
     intent = (state.get("intent") or "ambiguous").lower()
     error = state.get("error")
 
-    # If the error came from classify_intent itself and we have no intent,
-    # short-circuit to reply_generation with the fallback instruction.
+    # ── Agent escalation short-circuit ────────────────────────────────────────
+    # When agent_escalated=True the reply_instruction has already been set
+    # to the human-handoff message by classify_intent.  Skip all automation.
+    if state.get("agent_escalated"):
+        logger.warning(
+            f"[router] thread={thread_id} agent_escalated=True — "
+            "routing directly to reply_generation (human handoff)"
+        )
+        return "reply_generation"
+
+    # ── classify_intent error guard ───────────────────────────────────────────
     if error and state.get("error_node") == "classify_intent":
         logger.warning(
             f"[router] classify_intent errored — routing to reply_generation. "
-            f"thread={state.get('thread_id')}"
+            f"thread={thread_id}"
         )
         return "reply_generation"
 
@@ -112,7 +129,7 @@ def route_after_intent(state: AgentState) -> str:
     destination = route_map.get(intent, "reply_generation")
     logger.info(
         f"[router] intent='{intent}' → '{destination}' "
-        f"thread={state.get('thread_id')}"
+        f"thread={thread_id}"
     )
     return destination
 
@@ -151,13 +168,15 @@ def build_graph() -> Any:
     """
     g = StateGraph(AgentState)
 
-    # Register all nodes
-    g.add_node("classify_intent", classify_intent)
-    g.add_node("negotiation",     negotiation)
-    g.add_node("scheduling",      scheduling)
-    g.add_node("rescheduling",    rescheduling)
-    g.add_node("reply_generation", reply_generation)
-    g.add_node("send_reply",      send_reply)
+    # Register all nodes — each wrapped with the observability layer that
+    # records an AgentRun DB row (start / finish / latency / error) without
+    # ever affecting the node's own business logic or DB transactions.
+    g.add_node("classify_intent",  with_observability(classify_intent,  "classify_intent"))
+    g.add_node("negotiation",      with_observability(negotiation,      "negotiation"))
+    g.add_node("scheduling",       with_observability(scheduling,       "scheduling"))
+    g.add_node("rescheduling",     with_observability(rescheduling,     "rescheduling"))
+    g.add_node("reply_generation", with_observability(reply_generation, "reply_generation"))
+    g.add_node("send_reply",       with_observability(send_reply,       "send_reply"))
 
     # Entry point
     g.set_entry_point("classify_intent")
@@ -221,8 +240,11 @@ async def run_agent(thread_id: int) -> AgentState:
 
     logger.info(f"[run_agent] Starting agent run for thread {thread_id}")
 
+    from app.repositories.config_repo import get_or_create_default
+
     async with AsyncSessionLocal() as db:
         memory = await load_thread_memory(db, thread_id)
+        agent_config = await get_or_create_default(db)
 
     if memory is None:
         logger.error(f"[run_agent] Thread {thread_id} not found — aborting.")
@@ -262,11 +284,16 @@ async def run_agent(thread_id: int) -> AgentState:
         "thread_status":      memory.thread_status,
         "messages":           memory.messages,
         "conversation_text":  memory.conversation_text,
-        # Negotiation memory
-        "negotiation_status":  memory.negotiation_status,
-        "max_budget":          memory.max_budget,
-        "current_offer":       memory.current_offer,
-        "counter_round":       0,
+        # Negotiation memory — counter_round and last_prospect_offer are loaded
+        # from the DB so walkaway logic accumulates correctly across emails.
+        "negotiation_status":    memory.negotiation_status,
+        "max_budget":            memory.max_budget,
+        "current_offer":         memory.current_offer,
+        "counter_round":         memory.counter_round,
+        "previous_prospect_offer": memory.last_prospect_offer,
+        # Agent-config budget ceiling overrides the DB max_budget fallback in
+        # the negotiation node when no prior negotiation row exists.
+        "budget_ceiling":        agent_config.budget_ceiling if agent_config else None,
         # Meeting memory
         "meeting_status":     memory.meeting_status,
         "google_event_id":    memory.google_event_id,
@@ -274,9 +301,23 @@ async def run_agent(thread_id: int) -> AgentState:
             memory.scheduled_at.isoformat() if memory.scheduled_at else None
         ),
         "reschedule_count":   memory.reschedule_count,
+        # Calendar escalation (Phase 4)
+        "needs_human_review":     memory.needs_human_review,
+        "calendar_failure_count": memory.calendar_failure_count,
+        # Agent escalation (Phase 5)
+        "agent_escalated":        memory.agent_escalated,
+        "escalation_reason":      memory.escalation_reason,
+        "ambiguous_count":        memory.ambiguous_count,
+        "thread_summary":         memory.thread_summary,
         # Flags
         "reply_sent":         False,
         "available_slots":    [],
+        # Config-driven behaviour (Phase 8)
+        "tone":                          agent_config.tone if agent_config else None,
+        "recruiter_name":                agent_config.recruiter_name if agent_config else "Alex",
+        "recruiter_title":               agent_config.recruiter_title if agent_config else "HR Recruiter",
+        "recruiter_signature":           agent_config.recruiter_signature if agent_config else "",
+        "meeting_confirmation_template": agent_config.meeting_confirmation_template if agent_config else None,
     }
 
     logger.info(

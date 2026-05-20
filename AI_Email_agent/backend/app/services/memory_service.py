@@ -60,12 +60,31 @@ class ThreadMemory:
     negotiation_status: Optional[str] = None
     max_budget: Optional[float] = None
     current_offer: Optional[float] = None
+    # Round counter persisted in DB so walkaway logic accumulates across emails
+    counter_round: int = 0
+    # Last prospect offer for Rule 3 (not moving → walkaway)
+    last_prospect_offer: Optional[float] = None
 
     # Meeting memory
     meeting_status: Optional[str] = None
     google_event_id: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     reschedule_count: int = 0
+
+    # Human escalation — calendar-specific (Phase 4)
+    needs_human_review: bool = False
+    calendar_failure_count: int = 0
+
+    # Agent-level escalation (Phase 5)
+    # agent_escalated: True when the agent cannot handle the thread autonomously
+    # (repeated ambiguity, low-confidence high-stakes intent, API failures).
+    agent_escalated: bool = False
+    escalation_reason: Optional[str] = None
+    ambiguous_count: int = 0
+
+    # Rolling memory summary (Phase 5)
+    # Compressed LLM summary of messages older than the memory window.
+    thread_summary: Optional[str] = None
 
 
 # ── Message Persistence ───────────────────────────────────────────────────────
@@ -78,18 +97,23 @@ async def save_message(
     timestamp: datetime,
     intent: Optional[str] = None,
     raw_payload: Optional[dict[str, Any]] = None,
+    gmail_message_id: Optional[str] = None,
 ) -> EmailMessage:
     """
     Persist an email message (inbound or outbound) to the DB.
 
     Args:
-        db:          Async DB session.
-        thread_id:   DB ID of the parent EmailThread.
-        sender:      Sender email address or "agent".
-        body:        Plain-text email body.
-        timestamp:   Message timestamp (timezone-aware).
-        intent:      Detected intent label (optional, set after classification).
-        raw_payload: Raw Gmail API payload dict (optional).
+        db:               Async DB session.
+        thread_id:        DB ID of the parent EmailThread.
+        sender:           Sender email address or "agent".
+        body:             Plain-text email body.
+        timestamp:        Message timestamp (timezone-aware).
+        intent:           Detected intent label (optional, set after classification).
+        raw_payload:      Raw Gmail API payload dict (optional).
+        gmail_message_id: Gmail API message ID (e.g. "17f9e2f3d8c4a1b2").
+                          Stored in a dedicated indexed column for fast idempotency
+                          checks.  Always pass this for inbound messages;
+                          pass it for outbound messages once the Gmail send returns.
 
     Returns:
         Saved EmailMessage ORM instance.
@@ -101,12 +125,13 @@ async def save_message(
         timestamp=timestamp,
         intent=intent,
         raw_payload=raw_payload,
+        gmail_message_id=gmail_message_id,
     )
     db.add(msg)
     await db.flush()
     logger.debug(
         f"Message saved | thread_id={thread_id} sender={sender} "
-        f"intent={intent} id={msg.id}"
+        f"gmail_message_id={gmail_message_id} intent={intent} id={msg.id}"
     )
     return msg
 
@@ -209,22 +234,26 @@ async def get_or_create_thread(
 
     if thread is None:
         try:
-            thread = EmailThread(
-                gmail_thread_id=gmail_thread_id,
-                prospect_id=prospect_id,
-                subject=subject,
-                status=ThreadStatus.PENDING.value,
-            )
-            db.add(thread)
-            await db.flush()
+            # Use a savepoint so that an IntegrityError on concurrent INSERT
+            # only rolls back this one statement, not the entire outer
+            # transaction (which may already contain saved messages from the
+            # current poll batch).
+            async with db.begin_nested():
+                thread = EmailThread(
+                    gmail_thread_id=gmail_thread_id,
+                    prospect_id=prospect_id,
+                    subject=subject,
+                    status=ThreadStatus.PENDING.value,
+                )
+                db.add(thread)
+                await db.flush()
             logger.info(
                 f"Thread created | gmail_thread_id={gmail_thread_id} "
                 f"prospect_id={prospect_id} id={thread.id}"
             )
         except IntegrityError:
-            # Another concurrent task already inserted this thread — roll back
-            # the savepoint and re-fetch the existing row.
-            await db.rollback()
+            # Another concurrent task already inserted this thread — the
+            # savepoint was rolled back; re-fetch the existing row.
             result = await db.execute(
                 select(EmailThread).where(EmailThread.gmail_thread_id == gmail_thread_id)
             )
@@ -296,9 +325,18 @@ async def load_thread_memory(
 
     # Load messages
     messages = await load_thread_history(db, thread_id)
-    conversation_text = format_conversation_for_llm(messages)
+    # Use windowed context: full history for short threads, summary + recent
+    # messages for long threads — prevents sending megabyte-size prompts.
+    from app.core.config import settings
+    conversation_text = build_windowed_context(
+        messages=messages,
+        summary=thread.thread_summary,
+        window=settings.MEMORY_WINDOW_MESSAGES,
+    )
 
-    # Serialize messages for agent state
+    # Serialize messages for agent state.
+    # raw_payload is included so negotiation._extract_prospect_offer can read
+    # structured amount fields that LLM/Gmail parsing may have stored there.
     messages_dicts = [
         {
             "id": m.id,
@@ -306,6 +344,7 @@ async def load_thread_memory(
             "body": m.body,
             "intent": m.intent,
             "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+            "raw_payload": m.raw_payload,
         }
         for m in messages
     ]
@@ -337,11 +376,21 @@ async def load_thread_memory(
         negotiation_status=negotiation.status if negotiation else None,
         max_budget=negotiation.max_budget if negotiation else None,
         current_offer=negotiation.current_offer if negotiation else None,
+        counter_round=negotiation.counter_round if negotiation else 0,
+        last_prospect_offer=negotiation.last_prospect_offer if negotiation else None,
         # Meeting
         meeting_status=meeting.status if meeting else None,
         google_event_id=meeting.google_event_id if meeting else None,
         scheduled_at=meeting.scheduled_at if meeting else None,
         reschedule_count=meeting.reschedule_count if meeting else 0,
+        # Calendar escalation (Phase 4)
+        needs_human_review=meeting.needs_human_review if meeting else False,
+        calendar_failure_count=meeting.calendar_failure_count if meeting else 0,
+        # Agent escalation (Phase 5)
+        agent_escalated=thread.agent_escalated,
+        escalation_reason=thread.escalation_reason,
+        ambiguous_count=thread.ambiguous_count,
+        thread_summary=thread.thread_summary,
     )
 
     logger.info(
@@ -502,6 +551,223 @@ async def cancel_meeting(
     await db.flush()
     logger.info(f"Meeting {meeting.id} cancelled.")
     return meeting
+
+
+async def increment_calendar_failure(
+    db: AsyncSession,
+    thread_id: int,
+    max_failures: int = 3,
+) -> tuple[int, bool]:
+    """
+    Increment the ``calendar_failure_count`` for the meeting associated with
+    *thread_id* and conditionally set ``needs_human_review``.
+
+    Called from scheduling and rescheduling nodes when a CalendarOpError is
+    caught, so that repeated failures are tracked and escalated.
+
+    Args:
+        db:           Async DB session (caller must commit after this returns).
+        thread_id:    DB primary key of the EmailThread.
+        max_failures: Threshold above which ``needs_human_review`` is set True.
+                      Defaults to 3; override via settings.CALENDAR_MAX_FAILURES.
+
+    Returns:
+        (new_failure_count, needs_human_review)
+    """
+    meeting = await get_or_create_meeting(db, thread_id)
+    meeting.calendar_failure_count = (meeting.calendar_failure_count or 0) + 1
+    needs_review = meeting.calendar_failure_count >= max_failures
+    if needs_review and not meeting.needs_human_review:
+        meeting.needs_human_review = True
+        logger.warning(
+            f"Meeting {meeting.id} (thread={thread_id}) reached "
+            f"{meeting.calendar_failure_count} calendar failures — "
+            "flagged for human review"
+        )
+    db.add(meeting)
+    await db.flush()
+    return meeting.calendar_failure_count, meeting.needs_human_review
+
+
+# ── Rolling Memory (Phase 5) ──────────────────────────────────────────────────
+
+def build_windowed_context(
+    messages: list,
+    summary: Optional[str] = None,
+    window: int = 20,
+) -> str:
+    """
+    Build a conversation context string that fits within the LLM's practical
+    token budget.
+
+    Strategy:
+      - If the thread has ≤ *window* messages: return the full formatted history
+        (existing behaviour, zero regression for short threads).
+      - If the thread has > *window* messages: return the stored *summary*
+        (if any) prepended to the *window* most-recent messages.
+        If no summary exists yet, add a notice about the omitted count.
+
+    Args:
+        messages:  All EmailMessage ORM objects for the thread (oldest-first).
+        summary:   The EmailThread.thread_summary value (may be None).
+        window:    Number of most-recent messages to include verbatim.
+
+    Returns:
+        A plain-text string ready for injection into an LLM prompt.
+    """
+    if len(messages) <= window:
+        return format_conversation_for_llm(messages)
+
+    recent = messages[-window:]
+    recent_text = format_conversation_for_llm(recent)
+
+    omitted_count = len(messages) - window
+
+    if summary:
+        header = (
+            f"[Conversation summary — {omitted_count} older message(s) compressed]\n"
+            f"{summary}\n\n"
+            f"[{window} most recent messages]\n"
+        )
+    else:
+        header = (
+            f"[{omitted_count} earlier message(s) not shown — "
+            "no summary available yet]\n\n"
+        )
+
+    return header + recent_text
+
+
+async def increment_ambiguous_count(
+    db: AsyncSession,
+    thread_id: int,
+    threshold: int = 3,
+) -> tuple[int, bool]:
+    """
+    Increment ``EmailThread.ambiguous_count`` for *thread_id* and check if
+    the escalation threshold has been reached.
+
+    Called when classify_intent returns "ambiguous" (after confidence
+    downgrade or genuine ambiguity).
+
+    Args:
+        db:        Async DB session (caller must commit after this returns).
+        thread_id: DB primary key of the EmailThread.
+        threshold: Consecutive-ambiguous count that triggers escalation.
+
+    Returns:
+        (new_count, agent_escalated) — agent_escalated is True when the
+        threshold has just been reached.
+    """
+    result = await db.execute(
+        select(EmailThread).where(EmailThread.id == thread_id)
+    )
+    thread = result.scalar_one_or_none()
+    if thread is None:
+        return 0, False
+
+    thread.ambiguous_count = (thread.ambiguous_count or 0) + 1
+    newly_escalated = (
+        thread.ambiguous_count >= threshold
+        and not thread.agent_escalated
+    )
+    if newly_escalated:
+        thread.agent_escalated = True
+        reason = (
+            f"Repeated ambiguous intent: {thread.ambiguous_count} consecutive "
+            "classifications — forwarding to human operator."
+        )
+        thread.escalation_reason = reason
+        logger.warning(
+            f"Thread {thread_id} escalated | reason='{reason}'"
+        )
+    db.add(thread)
+    await db.flush()
+    return thread.ambiguous_count, thread.agent_escalated
+
+
+async def reset_ambiguous_count(
+    db: AsyncSession,
+    thread_id: int,
+) -> None:
+    """
+    Reset ``EmailThread.ambiguous_count`` to 0 when a clear (non-ambiguous)
+    intent is classified.  This prevents stale counters from triggering false
+    escalations after a prospect finally responds clearly.
+
+    Args:
+        db:        Async DB session (caller must commit after this returns).
+        thread_id: DB primary key of the EmailThread.
+    """
+    result = await db.execute(
+        select(EmailThread).where(EmailThread.id == thread_id)
+    )
+    thread = result.scalar_one_or_none()
+    if thread and thread.ambiguous_count > 0:
+        thread.ambiguous_count = 0
+        db.add(thread)
+        await db.flush()
+        logger.debug(f"Thread {thread_id} ambiguous_count reset to 0")
+
+
+async def escalate_thread(
+    db: AsyncSession,
+    thread_id: int,
+    reason: str,
+) -> None:
+    """
+    Set ``agent_escalated=True`` and record the *reason* on the EmailThread.
+
+    Called from any node that determines the agent can no longer handle the
+    conversation autonomously (e.g. repeated API failures, negotiation
+    deadlock).
+
+    Args:
+        db:        Async DB session (caller must commit after this returns).
+        thread_id: DB primary key of the EmailThread.
+        reason:    Human-readable escalation reason (stored for operator review).
+    """
+    result = await db.execute(
+        select(EmailThread).where(EmailThread.id == thread_id)
+    )
+    thread = result.scalar_one_or_none()
+    if thread and not thread.agent_escalated:
+        thread.agent_escalated = True
+        thread.escalation_reason = reason[:512]  # respect column length
+        db.add(thread)
+        await db.flush()
+        logger.warning(
+            f"Thread {thread_id} escalated | reason='{reason}'"
+        )
+
+
+async def update_thread_summary(
+    db: AsyncSession,
+    thread_id: int,
+    summary: str,
+) -> None:
+    """
+    Persist a new rolling *summary* for the thread.
+
+    Called by the summarization service after generating or updating the
+    compressed conversation history.
+
+    Args:
+        db:        Async DB session (caller must commit after this returns).
+        thread_id: DB primary key of the EmailThread.
+        summary:   The new summary text to store.
+    """
+    result = await db.execute(
+        select(EmailThread).where(EmailThread.id == thread_id)
+    )
+    thread = result.scalar_one_or_none()
+    if thread:
+        thread.thread_summary = summary
+        db.add(thread)
+        await db.flush()
+        logger.info(
+            f"Thread {thread_id} summary updated | length={len(summary)}"
+        )
 
 
 # ── Negotiation State ─────────────────────────────────────────────────────────

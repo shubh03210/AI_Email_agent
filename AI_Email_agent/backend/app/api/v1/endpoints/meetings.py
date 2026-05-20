@@ -2,6 +2,13 @@
 Meetings API
 ─────────────
 Endpoints for viewing and managing scheduled meetings.
+
+Role matrix
+───────────
+  GET  /              admin, operator  (list)
+  GET  /{id}          admin, operator  (read)
+  POST /{id}/cancel   admin only       (destructive state change)
+  POST /{id}/reschedule  admin, operator  (agent operation)
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import get_db
+from app.api.v1.deps import get_db, require_admin, require_operator_or_admin
 from app.core.logging import logger
 from app.models.meeting import MeetingStatus
 from app.repositories import meeting_repo
@@ -63,7 +70,8 @@ async def get_meeting(
 @router.post(
     "/{meeting_id}/cancel",
     response_model=MeetingRead,
-    summary="Cancel a meeting",
+    summary="Cancel a meeting  [admin]",
+    dependencies=[Depends(require_admin)],
 )
 async def cancel_meeting(
     meeting_id: int,
@@ -71,6 +79,7 @@ async def cancel_meeting(
 ) -> MeetingRead:
     """
     Cancel a meeting and (if possible) remove the Google Calendar event.
+    Restricted to admins — operators may trigger reschedule but not unilateral cancellation.
     """
     meeting = await meeting_repo.get_by_id(db, meeting_id)
     if not meeting:
@@ -84,7 +93,6 @@ async def cancel_meeting(
             detail="Meeting is already cancelled.",
         )
 
-    # Best-effort Google Calendar cancellation
     if meeting.google_event_id:
         try:
             from app.services.calendar_service import cancel_event
@@ -106,14 +114,15 @@ async def cancel_meeting(
 @router.post(
     "/{meeting_id}/reschedule",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Trigger rescheduling for a meeting",
+    summary="Trigger rescheduling for a meeting  [admin, operator]",
 )
 async def reschedule_meeting(
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
+    _: object = Depends(require_operator_or_admin),
 ) -> dict:
     """
-    Enqueue a Celery task to run the rescheduling agent flow for this meeting.
+    Enqueue a Celery task to run the rescheduling agent flow.
     The agent will find a new slot, cancel the old event, create a new one,
     and send a reply email to the prospect.
     """

@@ -17,6 +17,7 @@ Output keys added to state:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from datetime import timezone as dt_timezone
 
@@ -59,6 +60,11 @@ async def send_reply(state: AgentState) -> AgentState:
     intent = state.get("intent", "unknown")
     error = state.get("error")
 
+    # Append recruiter signature (Phase 8) — injected after the LLM body.
+    recruiter_signature = (state.get("recruiter_signature") or "").strip()
+    if recruiter_signature and reply_body:
+        reply_body = f"{reply_body}\n\n{recruiter_signature}"
+
     logger.info(f"[send_reply] thread={thread_id} intent={intent}")
 
     # Guard: nothing to send
@@ -77,15 +83,21 @@ async def send_reply(state: AgentState) -> AgentState:
         return {**state, "reply_sent": False}
 
     try:
-        # 1 — Send via Gmail
-        reply_to_thread(
+        # 1 — Send via Gmail; capture the returned SentMessage so we can
+        # persist the Gmail message_id for idempotency and audit purposes.
+        # reply_to_thread uses a synchronous Google API client — run it in a
+        # thread pool worker so the event loop is not blocked.
+        sent_msg = await asyncio.to_thread(
+            reply_to_thread,
             thread_id=gmail_thread_id,
             to=prospect_email,
             subject=reply_subject,
             body=reply_body,
         )
+        gmail_sent_msg_id: str | None = sent_msg.message_id if sent_msg else None
         logger.info(
-            f"[send_reply] Email sent to {prospect_email} | thread={thread_id}"
+            f"[send_reply] Email sent to {prospect_email} | "
+            f"thread={thread_id} gmail_msg_id={gmail_sent_msg_id}"
         )
 
         # 2 — Persist outbound message + update thread & prospect statuses
@@ -97,6 +109,7 @@ async def send_reply(state: AgentState) -> AgentState:
                 body=reply_body,
                 timestamp=datetime.now(dt_timezone.utc),
                 intent=None,
+                gmail_message_id=gmail_sent_msg_id,
             )
 
             # 3 — Update thread status
@@ -125,9 +138,17 @@ async def send_reply(state: AgentState) -> AgentState:
             await db.commit()
 
         logger.info(
-            f"[send_reply] Message saved + thread status → '{new_status}' "
+            f"[send_reply] Message saved + thread status → '{new_thread_status}' "
             f"| thread={thread_id}"
         )
+
+        # ── Rolling summary (Phase 5) ─────────────────────────────────────
+        # If the thread has grown long enough, generate a compact LLM summary
+        # of the older messages so future runs use a windowed context instead
+        # of the full unbounded history.  This runs AFTER the reply is sent
+        # and committed, so it never blocks the critical send path.
+        message_count = len(state.get("messages") or [])
+        await _maybe_update_summary(thread_id, message_count + 1)
 
         return {**state, "reply_sent": True}
 
@@ -142,6 +163,18 @@ async def send_reply(state: AgentState) -> AgentState:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _maybe_update_summary(thread_id: int, message_count: int) -> None:
+    """Trigger rolling summary if the thread has grown long enough."""
+    try:
+        from app.services.summarization_service import maybe_update_summary
+        await maybe_update_summary(thread_id, message_count)
+    except Exception as exc:
+        logger.warning(
+            f"[send_reply] Rolling summary update failed for thread={thread_id}: "
+            f"{exc} — continuing without update"
+        )
+
 
 def _resolve_thread_status(state: AgentState) -> str:
     """
@@ -160,7 +193,7 @@ def _resolve_thread_status(state: AgentState) -> str:
     meeting_status = state.get("meeting_status", "")
 
     if (
-        meeting_status in ("confirmed", "rescheduled")
+        meeting_status in ("confirmed", "rescheduled", "cancelled")
         or intent == "declined"
         or negotiation_action == "walkaway"
     ):
