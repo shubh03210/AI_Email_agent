@@ -31,10 +31,17 @@ intervention.
 |---|---|
 | Backend API | FastAPI (async) |
 | Agent Orchestration | LangGraph |
+<<<<<<< HEAD
 | LLM | Groq — Llama 3.3-70b-versatile |
 | Email | Gmail API (OAuth 2.0) |
 | Calendar | Google Calendar API (OAuth 2.0) |
 | Database | PostgreSQL via Supabase (async SQLAlchemy + Alembic) |
+=======
+| LLM | Groq |
+| Email | Gmail API |
+| Calendar | Google Calendar API |
+| Database | PostgreSQL + SQLAlchemy (async) |
+>>>>>>> bb28b289309ce9694b277800faf2fabac188ae43
 | Task Queue | Celery + Redis |
 | Frontend | React 19 + Vite + Tailwind CSS v4 |
 | Containers | Docker + Docker Compose |
