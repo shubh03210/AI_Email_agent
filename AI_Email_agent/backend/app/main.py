@@ -54,6 +54,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
     logger.info(f"Environment: {'debug' if settings.DEBUG else 'production'}")
     logger.info(f"Docs: http://localhost:8000{settings.API_V1_STR}/docs")
+    logger.info(
+        "Prospect replies are processed by Celery (poll inbox + run agent). "
+        "Use `python run.py` locally — uvicorn alone will not auto-run the agent."
+    )
 
     # ── Deployment readiness checks ───────────────────────────────────────────
     # Validate environment variables and credential files at startup.

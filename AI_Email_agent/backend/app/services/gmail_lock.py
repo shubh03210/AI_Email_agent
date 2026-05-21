@@ -254,6 +254,11 @@ def mark_agent_queued(thread_id: int) -> None:
         )
 
 
+def clear_agent_queued(thread_id: int) -> None:
+    """Remove the enqueue guard so a new prospect reply can trigger another run."""
+    _release(f"{AGENT_QUEUED_PREFIX}{thread_id}")
+
+
 def is_agent_queued_or_running(thread_id: int) -> bool:
     """
     Check whether an agent run is already queued OR currently running for

@@ -4,9 +4,12 @@ Dev runner — starts all services with a single command:
 
 Starts (in order):
   1. Verifies Redis is reachable
-  2. Celery Worker  (background process)
-  3. Celery Beat    (background process)
-  4. FastAPI / Uvicorn (foreground — Ctrl+C here stops everything)
+  2. Celery Gmail worker   (inbox poll, outreach — logs/worker-gmail.log)
+  3. Celery Agent worker   (auto-runs agent on prospect replies — logs/worker-agent.log)
+  4. Celery Beat           (schedules inbox poll every GMAIL_POLL_INTERVAL_SECONDS)
+  5. FastAPI / Uvicorn     (foreground — Ctrl+C here stops everything)
+
+Do NOT use ``uvicorn`` alone — prospect replies and outreach require Celery.
 """
 
 import subprocess
@@ -36,6 +39,23 @@ def _banner(msg: str, color: str = "\033[96m") -> None:
     print(f"{color}{msg}{reset}", flush=True)
 
 
+def _celery_worker(name: str, queues: str, log_file: str, popen_flags: int) -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            "celery",
+            "-A", "app.workers.celery_app", "worker",
+            "--loglevel=info",
+            "--pool=solo",
+            f"--queues={queues}",
+            "--concurrency=1",
+            "-n", name,
+        ],
+        stdout=open(log_file, "a"),
+        stderr=subprocess.STDOUT,
+        creationflags=popen_flags,
+    )
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -47,7 +67,7 @@ def main() -> None:
     _banner("=" * 42)
 
     # ── 1. Redis check ────────────────────────────────────────────────────────
-    _banner("\n[1/4] Checking Redis...", "\033[93m")
+    _banner("\n[1/5] Checking Redis...", "\033[93m")
     retries = 0
     while not _redis_ok():
         retries += 1
@@ -90,24 +110,23 @@ def main() -> None:
     # Ctrl+C / uvicorn hot-reload signals don't cascade into them.
     _popen_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
 
-    # ── 2. Celery Worker ──────────────────────────────────────────────────────
-    _banner("\n[2/4] Starting Celery Worker...", "\033[93m")
-    worker = subprocess.Popen(
-        ["celery",
-         "-A", "app.workers.celery_app", "worker",
-         "--loglevel=info",
-         "--pool=solo",
-         "--queues=default,agent,gmail",
-         "--concurrency=1"],
-        stdout=open("logs/worker.log", "a"),
-        stderr=subprocess.STDOUT,
-        creationflags=_popen_flags,
+    # Separate workers so a long inbox poll does not block agent runs.
+    _banner("\n[2/5] Starting Celery Gmail worker...", "\033[93m")
+    gmail_worker = _celery_worker(
+        "gmail@%h", "gmail,default", "logs/worker-gmail.log", _popen_flags
     )
-    procs.append(worker)
-    _banner("  Celery Worker started  (logs -> backend/logs/worker.log)", "\033[92m")
+    procs.append(gmail_worker)
+    _banner("  Gmail worker started   (logs -> backend/logs/worker-gmail.log)", "\033[92m")
 
-    # ── 3. Celery Beat ────────────────────────────────────────────────────────
-    _banner("\n[3/4] Starting Celery Beat...", "\033[93m")
+    _banner("\n[3/5] Starting Celery Agent worker...", "\033[93m")
+    agent_worker = _celery_worker(
+        "agent@%h", "agent", "logs/worker-agent.log", _popen_flags
+    )
+    procs.append(agent_worker)
+    _banner("  Agent worker started   (logs -> backend/logs/worker-agent.log)", "\033[92m")
+
+    # ── 4. Celery Beat ────────────────────────────────────────────────────────
+    _banner("\n[4/5] Starting Celery Beat...", "\033[93m")
     beat = subprocess.Popen(
         ["celery",
          "-A", "app.workers.celery_app", "beat",
@@ -119,12 +138,16 @@ def main() -> None:
     )
     procs.append(beat)
     _banner("  Celery Beat started    (logs -> backend/logs/beat.log)", "\033[92m")
+    _banner(
+        "  Inbox poll runs every 60s — new prospect replies auto-trigger the agent.",
+        "\033[90m",
+    )
 
     # Give workers a moment to connect to Redis before API starts accepting requests
     time.sleep(3)
 
-    # ── 4. FastAPI / Uvicorn (foreground) ─────────────────────────────────────
-    _banner("\n[4/4] Starting FastAPI...", "\033[93m")
+    # ── 5. FastAPI / Uvicorn (foreground) ─────────────────────────────────────
+    _banner("\n[5/5] Starting FastAPI...", "\033[93m")
     _banner("  Dashboard API -> http://localhost:8000", "\033[92m")
     _banner("  Press Ctrl+C to stop everything.\n", "\033[90m")
 

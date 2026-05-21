@@ -42,12 +42,13 @@ def _run(coro):
 
 from celery import Task
 from celery.utils.log import get_task_logger
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.services.gmail_lock import (
     acquire_message_lock,
     acquire_outreach_lock,
     acquire_thread_lock,
+    clear_agent_queued,
     is_agent_queued_or_running,
     mark_agent_queued,
     release_outreach_lock,
@@ -210,7 +211,9 @@ async def _poll_inbox() -> dict[str, Any]:
                 # Unknown senders (newsletters, notifications, etc.) are
                 # intentionally ignored; prospects must be added manually.
                 result = await db.execute(
-                    select(Prospect).where(Prospect.email == sender_email)
+                    select(Prospect).where(
+                        func.lower(Prospect.email) == sender_email
+                    )
                 )
                 prospect = result.scalar_one_or_none()
 
@@ -245,14 +248,13 @@ async def _poll_inbox() -> dict[str, Any]:
                     )
                     processed += 1
 
-                    # Only enqueue the agent when this specific message is new.
-                    # Two-level deduplication:
-                    #   1. Per-cycle set (enqueued_thread_ids) prevents multiple
-                    #      messages in the SAME poll cycle from triggering
-                    #      multiple enqueues for one thread.
-                    #   2. Redis key (lock:agent_queued:{id}) prevents SUCCESSIVE
-                    #      poll cycles from re-enqueueing a thread whose agent run
-                    #      is still queued or running.
+                # Enqueue agent for new replies OR when a saved prospect message
+                # still has no agent response (worker was down, task failed, etc.).
+                needs_agent = (
+                    not already_saved
+                    or await _thread_awaiting_agent_reply(db, thread.id)
+                )
+                if needs_agent:
                     if (
                         thread.id not in enqueued_thread_ids
                         and not is_agent_queued_or_running(thread.id)
@@ -267,7 +269,7 @@ async def _poll_inbox() -> dict[str, Any]:
                         logger.info(
                             f"[poll_inbox] Enqueued agent run for thread {thread.id}"
                         )
-                    elif thread.id in enqueued_thread_ids or is_agent_queued_or_running(thread.id):
+                    else:
                         logger.debug(
                             f"[poll_inbox] Agent run already queued/running for "
                             f"thread {thread.id} — skipping duplicate enqueue"
@@ -339,6 +341,8 @@ def run_agent_task(self, thread_id: int) -> dict[str, Any]:
 
     try:
         result = _run(_run_agent(thread_id))
+        if not result.get("error"):
+            clear_agent_queued(thread_id)
         logger.info(
             f"[run_agent_task] Done | thread={thread_id} "
             f"intent={result.get('intent')} reply_sent={result.get('reply_sent')}"
@@ -834,6 +838,25 @@ def _parse_email_address(raw: str) -> str:
     if "<" in raw and ">" in raw:
         return raw[raw.index("<") + 1 : raw.index(">")].strip().lower()
     return raw.lower()
+
+
+async def _thread_awaiting_agent_reply(db: Any, thread_id: int) -> bool:
+    """
+    True when the latest message in the thread is from the prospect (not the agent),
+    meaning the agent still needs to read and respond.
+    """
+    from app.models.email_message import EmailMessage
+
+    result = await db.execute(
+        select(EmailMessage.sender)
+        .where(EmailMessage.thread_id == thread_id)
+        .order_by(EmailMessage.timestamp.desc())
+        .limit(1)
+    )
+    latest_sender = result.scalar_one_or_none()
+    if not latest_sender:
+        return False
+    return latest_sender.strip().lower() != "agent"
 
 
 async def _message_already_saved(db: Any, gmail_msg_id: str) -> bool:

@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import get_db
@@ -38,7 +38,8 @@ router = APIRouter()
 @limiter.limit("5/minute")
 async def login(
     request: Request,
-    form: OAuth2PasswordRequestForm = Depends(),
+    username: str = Form(),
+    password: str = Form(),
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     """
@@ -57,15 +58,15 @@ async def login(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    user = await user_repo.get_by_username(db, form.username)
+    user = await user_repo.get_by_username(db, username)
 
-    if user is None or not verify_password(form.password, user.hashed_password):
-        logger.warning(f"Failed login attempt | username={form.username!r}")
+    if user is None or not verify_password(password, user.hashed_password):
+        logger.warning(f"Failed login attempt | username={username!r}")
         raise invalid_exc
 
     # get_by_username already filters is_active=True, but be explicit
     if not user.is_active:
-        logger.warning(f"Login attempt for inactive account | username={form.username!r}")
+        logger.warning(f"Login attempt for inactive account | username={username!r}")
         raise invalid_exc
 
     await user_repo.record_login(db, user)
